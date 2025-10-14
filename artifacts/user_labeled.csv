@@ -1,0 +1,4 @@
+user_cluster,nearest_car_cluster,car_age,km_driven,engine_cc,power_bhp,torque_nm,mileage_value,torque_rpm,seats,bhp_per_litre,nm_per_litre,log_km_driven,log_engine_cc,log_power_bhp,log_torque_nm,fuel,transmission,owner_simple,mileage_unit,make
+1,2,10.0,36000.0,,81.86,,22.32,,5.0,,,10.491301994830229,,4.417152436649256,,Petrol,Manual,,,Maruti
+0,0,7.0,66000.0,,81.86,,22.32,,7.0,,,11.097425172408931,,4.417152436649256,,Diesel,Automatic,,,Toyota
+1,2,6.0,24000.0,,100.0,,19.3,,5.0,,,10.085850775128717,,4.61512051684126,,Petrol,Automatic,,,Honda
