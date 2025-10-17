@@ -1,28 +1,29 @@
-# app.py — ultra-simple dealer app (no filters, clear section buttons, clustering & classification kept simple)
+# app.py — simple dealer app (uses your soft_buy_score, user-chosen clustering axis)
 import os, re, json
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 
-from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.cluster import KMeans
 
-# ---------------- CONFIG (no user tweaking) ----------------
+
+# ---------- FIXED CONFIG ----------
 OPENAI_MODEL = "gpt-4o-mini"
 OPENAI_TEMPERATURE = 0.2
 SYSTEM_PROMPT = (
     "You are DealBot, an expert assistant for a car dealership. "
-    "Use only the provided data context. Keep answers very concise (max 5 short lines)."
+    "Use ONLY the provided data context. Be concise (max 5 short lines)."
 )
-DATA_PATH = "exports/final_model_dataset.csv"  # <-- your dataset name (unchanged)
-TOP_N = 20  # how many rows to show by default
-GOOD_DEAL_THRESHOLD = 0.80  # deal_score ≥ threshold => 'Good deal'
-# ----------------------------------------------------------
+DATA_PATH = "exports/final_model_dataset.csv"  # your file, unchanged
+TOP_N = 20
+GOOD_DEAL_THRESHOLD = 0.80  # soft_buy_score ≥ threshold => 'Good deal'
+# ----------------------------------
 
-# OpenAI client (if missing, chat will show an error)
 try:
     from openai import OpenAI
     client = OpenAI()
@@ -31,12 +32,9 @@ except Exception:
 
 st.set_page_config(page_title="Dealer Deals", page_icon="🚗", layout="wide")
 
-# --- light styling: big “section” buttons & clean tables ---
 st.markdown("""
 <style>
-/* App-wide polish */
 section.main > div { padding-top: 0.5rem; }
-/* Big top buttons */
 .top-nav button[kind="secondary"] {
   border-radius: 9999px !important;
   padding: 0.6rem 1.1rem !important;
@@ -44,7 +42,6 @@ section.main > div { padding-top: 0.5rem; }
   border: 1px solid rgba(0,0,0,0.08) !important;
   box-shadow: 0 1px 2px rgba(0,0,0,0.05) !important;
 }
-/* Make dataframes compact & neat */
 .dataframe th, .dataframe td { font-size: 0.90rem; }
 </style>
 """, unsafe_allow_html=True)
@@ -60,7 +57,6 @@ def load_data():
     return df
 
 def pick_cols(df):
-    # Try to map common names → your dataset’s columns if present
     f = lambda cands: next((c for c in cands if c in df.columns), None)
     return dict(
         price=f(["selling_price","price"]),
@@ -73,53 +69,16 @@ def pick_cols(df):
         fuel=f(["fuel"]),
         trans=f(["transmission","gearbox"]),
         body=f(["body_type","type"]),
+        soft=f(["soft_buy_score","softbuy_score","soft_score"])  # your score
     )
 
-def compute_deal_score(df, c):
-    out = df.copy()
-    price, year, mileage, km = c["price"], c["year"], c["mileage"], c["km"]
-
-    # Fallback if we only have price
-    if not price:
-        out["deal_score"] = (-out.iloc[:,0].rank(pct=True))  # arbitrary fallback
-        return out
-
-    # Build simple expected-price model using whatever is available
-    features, cats = [], []
-    for f in [year, mileage, km]:
-        if f in out.columns: features.append(f)
-    for f in [c["make"], c["model"], c["fuel"], c["trans"], c["body"]]:
-        if f in out.columns: cats.append(f)
-
-    if not features and not cats:
-        out["deal_score"] = (-out[price]).rank(pct=True)
-        return out
-
-    pre = ColumnTransformer([
-        ("num", StandardScaler(), [f for f in features if f in out.columns]),
-        ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=0.02), [f for f in cats if f in out.columns]),
-    ], remainder="drop")
-
-    pipe = Pipeline([("prep", pre), ("reg", LinearRegression())])
-
-    try:
-        needed = [price] + [x for x in features+cats if x]
-        train = out.dropna(subset=[x for x in needed if x in out.columns])
-        X, y = train[[x for x in features+cats if x]], train[price]
-        pipe.fit(X, y)
-        out["expected_price"] = pipe.predict(out[[x for x in features+cats if x]].fillna(method="ffill").fillna(0))
-        out["deal_delta"] = out["expected_price"] - out[price]
-        out["deal_score"] = out["deal_delta"].rank(ascending=False, pct=True)
-    except Exception:
-        out["deal_score"] = (-out[price]).rank(pct=True)
-
-    return out
-
 def summarize_table(df, c, k=TOP_N):
-    show_cols = [x for x in [c["year"], c["make"], c["model"], c["price"], c["mileage"], c["km"], "deal_score"] if x in df.columns or x == "deal_score"]
-    tbl = df.sort_values(["deal_score", c["price"]] if c["price"] in df.columns else ["deal_score"],
-                         ascending=[False, True]).head(k)
-    return tbl[ [col for col in show_cols if col in tbl.columns] ]
+    score = c["soft"]
+    sort_cols = [score] if score in df.columns else ([c["price"]] if c["price"] in df.columns else [df.columns[0]])
+    asc = [False] if score in df.columns else [True]
+    tbl = df.sort_values(sort_cols, ascending=asc).head(k)
+    show_cols = [x for x in [c["year"], c["make"], c["model"], c["price"], c["mileage"], c["km"], score] if x in tbl.columns]
+    return tbl[show_cols] if show_cols else tbl.head(k)
 
 def relevant_rows(df, query, c, limit=25):
     if df.empty or not query or not query.strip():
@@ -127,7 +86,7 @@ def relevant_rows(df, query, c, limit=25):
     q = query.lower()
     text_cols = [x for x in [c["make"], c["model"], c["fuel"], c["trans"], c["body"]] if x in df.columns]
     text_cols += [x for x in df.columns if df[x].dtype == object]
-    text_cols = list(dict.fromkeys(text_cols))[:8]  # cap
+    text_cols = list(dict.fromkeys(text_cols))[:8]
     temp = df.copy()
     for col in text_cols: temp[col] = temp[col].astype(str).str.lower()
     temp["_blob"] = temp[text_cols].agg(" ".join, axis=1)
@@ -139,7 +98,7 @@ def relevant_rows(df, query, c, limit=25):
     return df.loc[temp.sort_values("_rel", ascending=False).head(limit).index]
 
 def to_context(df, c, n=15):
-    keep = [x for x in [c["year"], c["make"], c["model"], c["price"], c["mileage"], c["km"], "deal_score"] if x in df.columns or x=="deal_score"]
+    keep = [x for x in [c["year"], c["make"], c["model"], c["price"], c["mileage"], c["km"], c["soft"]] if x in df.columns]
     small = df[keep].head(n).reset_index(drop=True)
     small.insert(0, "id", small.index + 1)
     return small.to_dict(orient="records")
@@ -162,55 +121,67 @@ def ask_openai(msg, rows):
         return f"Error: {e}"
 
 # ---------------- Clustering ----------------
-def simple_clustering(df, c, k=5):
-    num_cols = [x for x in [c["price"], c["year"], c["mileage"], c["km"]] if x in df.columns]
-    if not num_cols: 
-        return None, None, None
-    base = df.dropna(subset=num_cols).copy()
-    scaler = StandardScaler()
-    X = scaler.fit_transform(base[num_cols])
-    km = KMeans(n_clusters=min(k, max(2, len(base)//50)), n_init="auto", random_state=42)
-    base["cluster"] = km.fit_predict(X)
-    centers = pd.DataFrame(scaler.inverse_transform(km.cluster_centers_), columns=num_cols)
-    return base, centers, num_cols
+def run_clustering(df, feature_cols, k=4):
+    try:
+        data = df[feature_cols].dropna().copy()  # keeps original df index
+        if data.empty or len(data) < k:
+            return None, None
 
-def name_clusters(centers, cols):
-    # Heuristic names based on relative values
+        scaler = StandardScaler()
+        X = scaler.fit_transform(data.values)
+
+        km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+        labels = km.fit_predict(X)
+
+        clustered = data.copy()
+        clustered["cluster"] = labels  # same index as df
+
+        centers_std = km.cluster_centers_
+        centers = pd.DataFrame(
+            scaler.inverse_transform(centers_std),
+            columns=feature_cols
+        )
+        centers.index.name = "cluster"
+        centers.reset_index(inplace=True)
+        return clustered, centers
+    except Exception:
+        return None, None
+
+
+def name_clusters(centers):
+    if centers is None: return {}
     names = {}
-    if centers is None: return names
     for i, row in centers.iterrows():
         tags = []
-        if "year" in cols:
-            tags.append("newer" if row["year"] >= centers["year"].median() else "older")
-        if any(x in cols for x in ["mileage", "km"]):
-            miles_col = "mileage" if "mileage" in cols else ("km" if "km" in cols else None)
-            if miles_col:
-                tags.append("low-mileage" if row[miles_col] <= centers[miles_col].median() else "high-mileage")
-        if "selling_price" in cols or "price" in cols:
-            pcol = "selling_price" if "selling_price" in cols else "price"
-            tags.append("budget" if row[pcol] <= centers[pcol].median() else "premium")
-        names[i] = " / ".join(tags).title()
+        for col in centers.columns:
+            tags.append(f"{col}:{'high' if row[col] >= centers[col].median() else 'low'}")
+        names[i] = " / ".join(tags)
     return names
 
 # ---------------- Classification ----------------
 @st.cache_resource
 def train_classifier(df, c):
-    if "deal_score" not in df.columns: 
-        return None
-    y = (df["deal_score"] >= GOOD_DEAL_THRESHOLD).astype(int)  # 1 = good deal
-    feat_num = [x for x in [c["year"], c["mileage"], c["km"]] if x in df.columns]
+    score = c["soft"]
+    if score not in df.columns: return None
+    y_raw = df[score].copy()
+    # If it's already 0/1, use it; else threshold to 1=good deal
+    if set(pd.Series(y_raw.dropna().unique()).astype(int)).issubset({0,1}) and y_raw.dropna().isin([0,1]).all():
+        y = y_raw.astype(int)
+    else:
+        y = (y_raw >= GOOD_DEAL_THRESHOLD).astype(int)
+
+    feat_num = [x for x in [c["year"], c["mileage"], c["km"], c["price"]] if x in df.columns]
     feat_cat = [x for x in [c["make"], c["model"], c["fuel"], c["trans"], c["body"]] if x in df.columns]
-    if not feat_num and not feat_cat:
-        return None
+    if not feat_num and not feat_cat: return None
+
     pre = ColumnTransformer([
         ("num", StandardScaler(), feat_num) if feat_num else ("num","drop",[]),
         ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=0.02), feat_cat) if feat_cat else ("cat","drop",[]),
     ])
+    safe = df.dropna(subset=feat_num + feat_cat).copy()
+    if safe.empty: return None
     clf = Pipeline([("prep", pre), ("clf", LogisticRegression(max_iter=1000))])
-    safe_df = df.dropna(subset=feat_num + feat_cat).copy()
-    if safe_df.empty:
-        return None
-    clf.fit(safe_df[feat_num + feat_cat], y.loc[safe_df.index])
+    clf.fit(safe[feat_num + feat_cat], y.loc[safe.index])
     return clf, feat_num + feat_cat
 
 # ==================== UI ====================
@@ -219,15 +190,13 @@ st.title("🚗 Dealer Deals")
 df = load_data()
 if df.empty: st.stop()
 st.caption(f"Loaded **{DATA_PATH}** — {df.shape[0]:,} rows")
-
 cols = pick_cols(df)
-scored = compute_deal_score(df, cols)
 
-# Navigation buttons (big & obvious)
+# Nav
 if "section" not in st.session_state:
     st.session_state.section = "Best Deals"
 
-st.write("")  # small spacing
+st.write("")
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     if st.button("🏆 Best Deals", type="secondary", use_container_width=True):
@@ -241,80 +210,195 @@ with c3:
 with c4:
     if st.button("✅ Classification", type="secondary", use_container_width=True):
         st.session_state.section = "Classification"
+st.write("")
 
-st.write("")  # spacing
-
-# ---------- Sections ----------
 section = st.session_state.section
 
+# ----------- Best Deals (uses soft_buy_score) -----------
 if section == "Best Deals":
     st.subheader("🏆 Best Deals (Top 20)")
-    top_tbl = summarize_table(scored, cols, k=TOP_N)
+    top_tbl = summarize_table(df, cols, k=TOP_N)
     st.dataframe(top_tbl, use_container_width=True, hide_index=True)
-    st.caption("“Deal Score” compares each car’s price to a simple expected price for its specs (higher is better).")
+    if cols["soft"] in df.columns:
+        st.caption("Sorted by your **soft_buy_score** (higher = better).")
+    else:
+        st.caption("soft_buy_score not found—showing a basic top list.")
 
+# ---------------- Chat ----------------
 elif section == "Chat":
     st.subheader("💬 Ask about the inventory")
-    # minimal UX: just the chat input — no advanced toggles
     if "chat" not in st.session_state: st.session_state.chat=[]
     for r,m in st.session_state.chat: st.chat_message(r).markdown(m)
-    msg = st.chat_input("Ask anything about the cars (e.g., 'Best SUVs under 15k')")
+    msg = st.chat_input("Ask anything (e.g., 'Best SUVs under 15k')")
     if msg:
         st.chat_message("user").markdown(msg)
-        # Ground the answer in a small, relevant slice
-        subset = relevant_rows(scored, msg, cols, limit=25)
+        subset = relevant_rows(df, msg, cols, limit=25)
         ctx = to_context(subset, cols, n=15)
         ans = ask_openai(msg, ctx)
         st.chat_message("assistant").markdown(ans)
         st.session_state.chat += [("user", msg), ("assistant", ans)]
 
+# ---------------- Clustering ----------------
 elif section == "Clustering":
-    st.subheader("🧩 Simple Clusters")
-    clustered, centers, num_cols = simple_clustering(scored, cols, k=5)
-    if clustered is None:
-        st.info("Not enough numeric columns to cluster.")
-    else:
-        names = name_clusters(centers, num_cols)
-        # Show a tiny summary: cluster sizes + center preview
+    st.subheader("🧩 Clustering")
+
+    import altair as alt
+
+    # figure out mileage column name from your mapping
+    mileage_col = cols["mileage"] if cols["mileage"] in df.columns else cols["km"]
+
+    options = {
+        "Year": [c for c in [cols["year"]] if c],
+        "Price": [c for c in [cols["price"]] if c],
+        "Mileage/KM": [c for c in [mileage_col] if c],
+        "Year + Price": [x for x in [cols["year"], cols["price"]] if x],
+    }
+
+    choice = st.radio("What to cluster by", list(options.keys()), horizontal=True)
+    k = st.slider("Clusters (k)", min_value=3, max_value=10, value=4, step=1)
+    view = st.radio("View", ["Table", "Plot"], horizontal=True)
+
+    use_cols = options[choice]
+    clustered, centers = run_clustering(df, use_cols, k=k)
+    if clustered is None or centers is None or len(centers) == 0:
+        st.info("Not enough data for that choice. Try a smaller k or a different axis.")
+        st.stop()
+
+    # readable names
+    name_map = name_clusters(centers.set_index("cluster").drop(columns=[c for c in ["cluster"] if c in centers.columns], errors="ignore"))
+    clustered["cluster_name"] = clustered["cluster"].map(name_map).fillna("Cluster")
+
+    # single overview table: centers + size
+    if view == "Table":
         sizes = clustered["cluster"].value_counts().rename_axis("cluster").reset_index(name="count")
-        sizes["name"] = sizes["cluster"].map(names).fillna("Cluster")
-        st.markdown("**Cluster Sizes**")
-        st.dataframe(sizes[["cluster","name","count"]], use_container_width=True, hide_index=True)
+        overview = centers.merge(sizes, on="cluster", how="left")
+        overview["name"] = overview["cluster"].map(name_map).fillna("Cluster")
 
-        st.markdown("**Cluster Centers (rough)**")
-        st.dataframe(centers.round(1), use_container_width=True, hide_index=True)
+        # tidy order
+        metric_cols = [c for c in [cols["year"], cols["price"], mileage_col] if c in overview.columns]
+        overview = overview[["cluster", "name", "count"] + metric_cols].sort_values("cluster")
 
-        # Show a compact sample per cluster
-        st.markdown("**Quick Samples per Cluster**")
-        show_cols = [x for x in [cols["year"], cols["make"], cols["model"], cols["price"], cols["mileage"], cols["km"], "deal_score", "cluster"] if (x in clustered.columns or x=="deal_score")]
-        sample = clustered.groupby("cluster").head(3)[show_cols].sort_values(["cluster","deal_score"], ascending=[True, False])
-        st.dataframe(sample, use_container_width=True, hide_index=True)
-        st.caption("Heuristic names summarize each cluster by price level, age, and mileage.")
+        st.markdown("**Cluster Overview**")
+        st.dataframe(overview.round(1), use_container_width=True, hide_index=True)
 
+    else:
+        # ---- Cluster Graph (network view) ----
+        st.markdown("**Cluster Graph**")
+
+        import networkx as nx
+        import plotly.graph_objects as go
+        from scipy.spatial.distance import pdist, squareform
+
+        G = nx.Graph()
+
+        # pairwise distances between centers (exclude 'cluster' col)
+        numeric_centers = centers.drop(columns=["cluster"], errors="ignore")
+        if numeric_centers.shape[0] > 1:
+            dists = squareform(pdist(numeric_centers.values))
+            thr = float(np.median(dists) * 1.5)
+            for i in range(len(dists)):
+                for j in range(i + 1, len(dists)):
+                    w = float(dists[i, j])
+                    if w < thr:
+                        G.add_edge(int(i), int(j), weight=w)
+
+        # nodes
+        for _, row in centers.iterrows():
+            idx = int(row["cluster"])
+            G.add_node(idx, label=f"Cluster {idx}", size=20)
+
+        pos = nx.spring_layout(G, seed=42, k=0.5)
+
+        # edges
+        edge_x, edge_y = [], []
+        for a, b in G.edges():
+            x0, y0 = pos[a]
+            x1, y1 = pos[b]
+            edge_x += [x0, x1, None]
+            edge_y += [y0, y1, None]
+
+        edge_trace = go.Scatter(
+            x=edge_x,
+            y=edge_y,
+            mode="lines",
+            hoverinfo="none",
+            line=dict(width=1, color="#888")
+        )
+
+        # nodes
+        node_x, node_y, text = [], [], []
+        for n in G.nodes():
+            x, y = pos[n]
+            node_x.append(x)
+            node_y.append(y)
+            text.append(f"Cluster {n}")
+
+        node_trace = go.Scatter(
+            x=node_x,
+            y=node_y,
+            mode="markers+text",
+            text=text,
+            textposition="top center",
+            marker=dict(
+                showscale=False,
+                color=list(G.nodes()),  # distinct colors per cluster id
+                size=22,
+                line=dict(width=2, color="DarkSlateGrey")
+            ),
+            hoverinfo="text"
+        )
+
+        fig = go.Figure(
+            data=[edge_trace, node_trace],
+            layout=go.Layout(
+                title=dict(text="Cluster Relationships", font=dict(size=18)),
+                showlegend=False,
+                hovermode="closest",
+                margin=dict(b=0, l=0, r=0, t=40),
+                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            )
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.caption("Each node is a cluster center; edges link clusters with similar centers.")
+
+
+
+
+
+
+# ---------------- Classification ----------------
 elif section == "Classification":
-    st.subheader("✅ Good-Deal Classifier")
-    model = train_classifier(scored, cols)
+    st.subheader("✅ Good-Deal Classifier (based on soft_buy_score)")
+    model = train_classifier(df, cols)
     if model is None:
-        st.info("Classifier could not be trained (not enough suitable columns).")
+        st.info("Classifier could not be trained (missing columns or empty rows).")
     else:
         clf, feat_cols = model
-        # Score a simple slice (top 30 by deal score) so user isn’t overwhelmed
-        slice_df = scored.sort_values("deal_score", ascending=False).head(30).copy()
+        slice_df = df.copy()
+        if cols["soft"] in slice_df.columns:
+            slice_df = slice_df.sort_values(cols["soft"], ascending=False)
+        slice_df = slice_df.head(30).copy()
+
         X = slice_df[[c for c in feat_cols if c in slice_df.columns]]
-        # Predict
         try:
             proba = clf.predict_proba(X)[:,1]
             slice_df["good_deal_prob"] = np.round(proba, 3)
             slice_df["label"] = np.where(slice_df["good_deal_prob"] >= 0.5, "Good deal", "Fair/Poor")
         except Exception:
-            slice_df["good_deal_prob"] = np.nan
-            slice_df["label"] = np.where(slice_df["deal_score"] >= GOOD_DEAL_THRESHOLD, "Good deal", "Fair/Poor")
+            if cols["soft"] in slice_df.columns:
+                slice_df["label"] = np.where(slice_df[cols["soft"]] >= GOOD_DEAL_THRESHOLD, "Good deal", "Fair/Poor")
+                slice_df["good_deal_prob"] = np.nan
+            else:
+                slice_df["label"] = "N/A"
+                slice_df["good_deal_prob"] = np.nan
 
-        show_cols = [x for x in [cols["year"], cols["make"], cols["model"], cols["price"], cols["mileage"], cols["km"], "deal_score", "good_deal_prob", "label"] if x in slice_df.columns or x in ["deal_score","good_deal_prob","label"]]
+        show_cols = [x for x in [cols["year"], cols["make"], cols["model"], cols["price"], mileage_col, cols["soft"], "good_deal_prob", "label"] if x in slice_df.columns or x in ["good_deal_prob","label"]]
         st.markdown("**Top Cars with Predicted Quality**")
         st.dataframe(slice_df[show_cols], use_container_width=True, hide_index=True)
-        st.caption("A lightweight logistic model marks likely good deals. No settings to tune — just the results.")
+        st.caption("Prediction target = (soft_buy_score ≥ threshold). Threshold is fixed in code.")
 
 # --------------- Footer ---------------
 st.write("")
-st.caption("Simplicity first: no filters, minimal knobs. Sections are one-click.")
+st.caption("Simplicity first: single-choice clustering; soft_buy_score drives rankings & labels.")
