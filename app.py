@@ -5,10 +5,12 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import ElasticNetCV
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.cluster import KMeans
+from sklearn.impute import SimpleImputer
 import joblib
 
 # ---------- CONFIG ----------
@@ -28,6 +30,9 @@ SYSTEM_PROMPT = (
     "- Be concise (≤ 5 short lines) and cite car name/year/price from the rows."
 )
 DATA_PATH = "exports/final_enriched_full.csv"  # <-- merged file with names
+# --- Pretrained model paths ---
+HEDONIC_MODEL_PATH = "models/hedonic_model.joblib"
+CLASSIFIER_MODEL_PATH = "models/classification_model.joblib"  # or .pkl if that's what you saved
 TOP_N = 20
 GOOD_DEAL_THRESHOLD = 0.80
 OWNER_PASSWORD = "123"
@@ -71,6 +76,23 @@ def load_data():
     # keep original training names — only strip whitespace
     df.columns = [c.strip() for c in df.columns]   # ← remove .replace(" ", "_")
     return df
+
+@st.cache_resource
+def load_hedonic_model():
+    try:
+        return joblib.load(HEDONIC_MODEL_PATH)  # either (pipeline, meta) or just pipeline
+    except Exception as e:
+        st.warning(f"Could not load hedonic model at {HEDONIC_MODEL_PATH}: {e}")
+        return None
+
+@st.cache_resource
+def load_classifier_model():
+    try:
+        return joblib.load(CLASSIFIER_MODEL_PATH)
+    except Exception as e:
+        st.warning(f"Could not load classifier model at {CLASSIFIER_MODEL_PATH}: {e}")
+        return None
+
 
 def pick_cols(df):
     f = lambda cands: next((c for c in cands if c in df.columns), None)
@@ -366,10 +388,12 @@ def apply_filters(df, filters):
     return out
 
 def run_clustering_flexible(df, numeric_cols, categorical_cols, k=5):
-    """
-    KMeans on a mixed feature space (scaled numeric + OHE categorical).
-    Returns: labels (Series aligned to df.index)
-    """
+    
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+    from sklearn.pipeline import Pipeline
+    from sklearn.cluster import KMeans
+    
     if df.empty:
         return None
 
@@ -377,31 +401,31 @@ def run_clustering_flexible(df, numeric_cols, categorical_cols, k=5):
     if not use_cols:
         return None
 
-    from sklearn.compose import ColumnTransformer
-    from sklearn.preprocessing import OneHotEncoder, StandardScaler
-    from sklearn.pipeline import Pipeline
-    from sklearn.cluster import KMeans
-
-    num_cols = [c for c in numeric_cols if c in df.columns]
-    cat_cols = [c for c in categorical_cols if c in df.columns]
-
     X = df[use_cols].copy()
-    for c in num_cols:
+    # coerce numerics
+    for c in [c for c in numeric_cols if c in X.columns]:
         X[c] = pd.to_numeric(X[c], errors="coerce")
-    X = X.dropna(subset=num_cols) if num_cols else X
+    # drop rows missing any numeric col (if we have numeric cols)
+    if numeric_cols:
+        X = X.dropna(subset=[c for c in numeric_cols if c in X.columns])
     if X.empty:
+        return None
+
+    # If too few rows for the requested K, lower K safely
+    k_eff = min(k, len(X))
+    if k_eff < 2:
         return None
 
     pre = ColumnTransformer(
         transformers=[
-            ("num", StandardScaler(), num_cols) if num_cols else ("num", "drop", []),
-            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols) if cat_cols else ("cat","drop",[]),
+            ("num", StandardScaler(), [c for c in numeric_cols if c in X.columns]) if numeric_cols else ("num","drop",[]),
+            ("cat", OneHotEncoder(handle_unknown="ignore"), [c for c in categorical_cols if c in X.columns]) if categorical_cols else ("cat","drop",[]),
         ]
     )
-    pipe = Pipeline([("prep", pre), ("km", KMeans(n_clusters=k, random_state=42, n_init="auto"))])
+    pipe = Pipeline([("prep", pre), ("km", KMeans(n_clusters=k_eff, random_state=42, n_init="auto"))])
     labels = pipe.fit_predict(X)
-    out = pd.Series(labels, index=X.index, name="cluster")
-    return out
+    return pd.Series(labels, index=X.index, name="cluster")
+
 
 def summarize_clusters(df_run, labels, numeric_cols_selected, categorical_cols_selected):
     """
@@ -640,55 +664,6 @@ def representative_rows(df_with_cluster, clus_col="cluster", n=8):
     return out
 
 
-@st.cache_resource
-def train_classifier(df, c):
-    from sklearn.compose import ColumnTransformer
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import OneHotEncoder, StandardScaler
-    from sklearn.linear_model import LogisticRegression
-
-    score = c["soft"]
-    if score not in df.columns:
-        return None
-
-    # 1) Clean target: coerce to numeric, drop non-finite
-    y_num = pd.to_numeric(df[score], errors="coerce").replace([np.inf, -np.inf], np.nan)
-
-    # 2) Decide if it's already 0/1 or needs thresholding
-    uniq = set(pd.unique(y_num.dropna()))
-    is_binary = uniq.issubset({0, 1})
-    y = (y_num >= GOOD_DEAL_THRESHOLD).astype(int) if not is_binary else y_num.astype(int)
-
-    # 3) Features
-    feat_num = [x for x in [c["year"], c.get("mileage"), c["km"], c["price"]] if x in df.columns]
-    feat_cat = [x for x in [c.get("make"), c["model"], c["fuel"], c["trans"], c["body"]] if x in df.columns]
-    if not feat_num and not feat_cat:
-        return None
-
-    pre = ColumnTransformer([
-        ("num", StandardScaler(), feat_num) if feat_num else ("num", "drop", []),
-        ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=0.02), feat_cat) if feat_cat else ("cat", "drop", []),
-    ])
-
-    # 4) Build safe training frame (numeric coercion, drop NA, sync y)
-    safe = df.copy()
-    for col in feat_num:
-        safe[col] = pd.to_numeric(safe[col], errors="coerce")
-    safe.replace([np.inf, -np.inf], np.nan, inplace=True)
-    safe = safe.dropna(subset=(feat_num + feat_cat))
-
-    # Align y to safe rows and drop any remaining NaNs in y
-    y_aligned = y.loc[safe.index].dropna()
-    safe = safe.loc[y_aligned.index]
-
-    if safe.empty:
-        return None
-
-    clf = Pipeline([("prep", pre), ("clf", LogisticRegression(max_iter=1000))])
-    clf.fit(safe[feat_num + feat_cat], y_aligned.astype(int))
-    return clf, feat_num + feat_cat
-
-
 # ==================== ROLE GATE ====================
 st.session_state.setdefault("role", None)
 st.session_state.setdefault("authed", False)
@@ -700,7 +675,7 @@ if st.session_state["role"]:
     # Button on top, single-line title underneath
     c1, _ = st.columns([0.3, 0.7])
     with c1:
-        if st.button("⬅ Switch role", use_container_width=True):
+        if st.button("⬅ Switch role", width="stretch", key="btn_switch_role"):
             st.session_state.update(role=None, authed=False, section=None)
             st.rerun()
         st.markdown(
@@ -715,11 +690,11 @@ if not st.session_state["role"]:
     st.subheader("Who are you?")
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Customer", use_container_width=True):
+        if st.button("Customer", width="stretch", key="btn_role_customer"):
             st.session_state.update(role="customer", authed=True, section="Chat")
             st.rerun()
     with col2:
-        if st.button("Owner", use_container_width=True):
+        if st.button("Owner", width="stretch", key="btn_role_owner"):
             st.session_state.update(role="owner", authed=False)
             st.rerun()
     st.stop()
@@ -762,6 +737,12 @@ def _fmt_eur(x):
         return "€{:,.2f}".format(float(x)).replace(",", " ")
     except Exception:
         return "€—"
+
+def _best_table(df_like: pd.DataFrame) -> pd.DataFrame:
+    # exact order, but fall back safely if any column is missing
+    wanted = ["brand", "model", "year", "price_eur_str", "km_driven"]
+    return df_like[[c for c in wanted if c in df_like.columns]]
+
 
 df["price_eur_str"] = df["price_eur"].apply(_fmt_eur) if "price_eur" in df.columns else "€—"
 
@@ -831,36 +812,137 @@ SCHEMA_HINT["ranking"] = [r for r in SCHEMA_HINT["ranking"] if r]
 
 df, BODY_USED = add_body_norm(df)
 
+# --- Demand index helpers (add near ML helpers) ---
+def _minmax(s):
+    s = s.replace([np.inf, -np.inf], np.nan)
+    if s.max() == s.min() or s.isna().all(): return pd.Series(0.0, index=s.index)
+    return (s - s.min()) / (s.max() - s.min())
+
+
+def compute_demand_index(df, hedonic_pack):
+    if hedonic_pack is None:
+        return None
+
+    # Unpack model
+    if isinstance(hedonic_pack, tuple) and len(hedonic_pack) == 2:
+        reg, meta = hedonic_pack
+        expected_num = list(meta.get("num", []))
+        expected_cat = list(meta.get("cat", []))
+    else:
+        reg = hedonic_pack
+        expected_num, expected_cat = [], []
+
+    # --- Build feature frame + engineered cols FIRST ---
+    X = df.copy()
+    X["price_eur"] = pd.to_numeric(X.get("price_eur"), errors="coerce")
+    X["km_driven"] = pd.to_numeric(X.get("km_driven"), errors="coerce")
+    X["year"] = pd.to_numeric(X.get("year"), errors="coerce")
+    X = X.dropna(subset=["price_eur","year"])
+
+    # engineered
+    this_year = pd.Timestamp.today().year
+    X["age"] = (this_year - X["year"]).clip(lower=0)
+    X["log_km"] = np.log1p(X["km_driven"].clip(lower=0)) if "km_driven" in X.columns else 0.0
+    X["age2"] = X["age"]**2
+
+    # if pipeline meta wasn't saved, read the columns it expects from the ColumnTransformer
+    if (not expected_num and not expected_cat) and hasattr(reg, "named_steps") and "prep" in reg.named_steps:
+        pre = reg.named_steps["prep"]
+        # prefer fitted transformers_ (post-fit)
+        tr_list = getattr(pre, "transformers_", getattr(pre, "transformers", []))
+        for name, tr, cols_used in tr_list:
+            if cols_used in (None, "drop"): 
+                continue
+            if name == "num":
+                expected_num = list(cols_used)
+            elif name == "cat":
+                expected_cat = list(cols_used)
+
+    # Ensure all expected columns exist (imputers will handle NaNs)
+    for col in (expected_num + expected_cat):
+        if col not in X.columns:
+            X[col] = np.nan
+
+    # Build the matrix in the exact column order the pipeline expects
+    feature_cols = [c for c in (expected_num + expected_cat) if c in X.columns]
+    if not feature_cols:
+        return None
+
+    Z = X[feature_cols]
+
+    # --- Predict log price and compute residuals ---
+    pred_log = reg.predict(Z)
+    resid = np.log(X["price_eur"].clip(lower=1.0)) - pred_log
+    X["_resid"] = resid
+
+    # Grouping key
+    keys = [k for k in ["brand","model","body_norm"] if k in X.columns]
+    if not keys: 
+        keys = ["brand"] if "brand" in X.columns else None
+    if not keys:
+        return None
+
+    g = X.groupby(keys, dropna=False)
+    out = g.agg(
+        n=("price_eur","size"),
+        median_price=("price_eur","median"),
+        resid_mean=("_resid","mean"),
+        soft_mean=("soft_buy_score","mean") if "soft_buy_score" in X.columns else ("_resid","mean")
+    ).reset_index()
+
+    # Blend into demand index
+    def _minmax(s):
+        s = s.replace([np.inf, -np.inf], np.nan)
+        if s.max() == s.min() or s.isna().all(): 
+            return pd.Series(0.0, index=s.index)
+        return (s - s.min()) / (s.max() - s.min())
+
+    out["scarcity"] = 1.0 / out["n"].clip(lower=1)
+    out["premium"] = out["resid_mean"]
+    out["desirability"] = out["soft_mean"] if "soft_buy_score" in X.columns else out["premium"]
+
+    sc = _minmax(out["scarcity"])
+    pr = _minmax(out["premium"])
+    ds = _minmax(out["desirability"])
+    out["demand_index"] = (0.4*sc + 0.4*pr + 0.2*ds)
+
+    out = out.sort_values("demand_index", ascending=False)
+    return out
+
+
+
 
 # ---------- Navigation ----------
 role = st.session_state["role"]
 if role == "owner":
-    if st.session_state["section"] not in ["Best Deals", "Classification"]:
+    if st.session_state["section"] not in ["Best Deals", "Classification", "Demand"]:
         st.session_state["section"] = "Best Deals"
 
-    # state for modal
     st.session_state.setdefault("show_check_modal", False)
 
-    c1, c2, c3 = st.columns([0.25, 0.25, 0.5])
+    c1, c2, c3, c4 = st.columns([0.2, 0.2, 0.2, 0.4])
     with c1:
-        if st.button("Best Deals", type="secondary", use_container_width=True):
+        if st.button("Best Deals", type="secondary", width="stretch", key="nav_best"):
             st.session_state["section"] = "Best Deals"; st.rerun()
     with c2:
-        if st.button("Classification", type="secondary", use_container_width=True):
+        if st.button("Classification", type="secondary", width="stretch", key="nav_class"):
             st.session_state["section"] = "Classification"; st.rerun()
     with c3:
-        if st.button("Add & Check Car", type="primary", use_container_width=True):
+        if st.button("Demand", type="secondary", width="stretch", key="nav_demand"):
+            st.session_state["section"] = "Demand"; st.rerun()
+    with c4:
+        if st.button("Add & Check Car", type="primary", width="stretch", key="nav_checkcar"):
             st.session_state["show_check_modal"] = True
-            # no st.rerun() here
+
 else:
     if st.session_state["section"] not in ["Chat", "Clustering"]:
         st.session_state["section"] = "Chat"
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("💬 Chat", type="secondary", use_container_width=True):
+        if st.button("💬 Chat", type="secondary", width="stretch", key="nav_chat"):
             st.session_state["section"] = "Chat"; st.rerun()
     with c2:
-        if st.button("🧩 Clustering", type="secondary", use_container_width=True):
+        if st.button("🧩 Clustering", type="secondary", width="stretch", key="nav_cluster"):
             st.session_state["section"] = "Clustering"; st.rerun()
 
 st.write("")
@@ -898,9 +980,9 @@ def render_check_car_form():
 
         cta1, cta2, _ = st.columns([0.2, 0.2, 0.6])
         with cta1:
-            checked  = st.form_submit_button("Check", type="primary", use_container_width=True)
+            checked  = st.form_submit_button("Check", type="primary", width="stretch", key="frm_check")
         with cta2:
-            canceled = st.form_submit_button("Cancel", use_container_width=True)
+            canceled = st.form_submit_button("Cancel", width="content", key="frm_cancel")
 
     if not (checked or canceled):
         return False, None, False
@@ -996,7 +1078,7 @@ if role == "owner" and st.session_state.get("show_check_modal", False):
                 st.rerun()
             if checked and sample_df is not None:
                 _predict_and_show(sample_df)
-            if st.button("Close", use_container_width=True):
+            if st.button("Close", width="stretch", key="dlg_close"):
                 st.session_state["show_check_modal"] = False
                 st.rerun()
 
@@ -1012,7 +1094,7 @@ if role == "owner" and st.session_state.get("show_check_modal", False):
                 st.rerun()
             if checked and sample_df is not None:
                 _predict_and_show(sample_df)
-            st.button("Close", use_container_width=True, on_click=lambda: st.session_state.update(show_check_modal=False))
+            st.button("Close", width="stretch", key="exp_close", on_click=lambda: st.session_state.update(show_check_modal=False))
 
 section = st.session_state["section"]
 
@@ -1023,8 +1105,8 @@ if section == "Best Deals" and role == "owner":
     if score_col not in df.columns:
         st.info("soft_buy_score not found—showing a basic top list.")
         tmp = df.copy()  # already has reliable 'car'
-        show_cols = [c for c in ["car","brand","model","year","price_eur_str","km_driven","engine_cc","power_bhp"] if c in tmp.columns]
-        st.dataframe(tmp.head(10)[show_cols], use_container_width=True, hide_index=True)
+        show_cols = [c for c in ["brand","model","year","price_eur_str","km_driven"] if c in tmp.columns]
+        st.dataframe(tmp.head(10)[show_cols], width="stretch", hide_index=True)
         st.stop()
 
 
@@ -1035,8 +1117,8 @@ if section == "Best Deals" and role == "owner":
         st.caption("No vehicles meet this criterion.")
     else:
         top_a = ensure_car_name(class_a.sort_values(score_col, ascending=False).head(10).copy())
-        show_cols = [c for c in ["car","brand","model","year","price_eur_str","km_driven","engine_cc","power_bhp"] if c in top_a.columns]
-        st.dataframe(top_a[show_cols], use_container_width=True, hide_index=True)
+        show_cols = [c for c in ["brand","model","year","price_eur_str","km_driven"] if c in top_a.columns]
+        st.dataframe(top_a[show_cols], width="stretch", hide_index=True)
 
 
     # --- Class B ---
@@ -1053,8 +1135,8 @@ if section == "Best Deals" and role == "owner":
                 top_b["car"] = top_b["brand"]
             else:
                 top_b["car"] = "—"
-        show_cols = [c for c in ["car","brand","model","year","price_eur_str","km_driven","engine_cc","power_bhp"] if c in top_b.columns]
-        st.dataframe(top_b[show_cols], use_container_width=True, hide_index=True)
+        show_cols = [c for c in ["brand","model","year","price_eur_str","km_driven"] if c in top_b.columns]
+        st.dataframe(top_b[show_cols], width="stretch", hide_index=True)
 
 
 
@@ -1067,7 +1149,7 @@ elif section == "Classification" and role == "owner":
         st.stop()
 
     # Train model for optional probability (kept, but we won't display it here)
-    model = train_classifier(df, cols)
+    model = CLASSIFIER_MODEL_PATH
     slice_df = df.copy()
     if model is not None:
         try:
@@ -1091,8 +1173,8 @@ elif section == "Classification" and role == "owner":
             st.caption("No vehicles meet this criterion.")
             return
         tmp = ensure_car_name(df_block)  # standardize
-        cols_to_show = [c for c in ["car","brand","model","year","price_eur_str","km_driven","engine_cc","power_bhp"] if c in tmp.columns]
-        st.dataframe(tmp[cols_to_show], use_container_width=True, hide_index=True)
+        cols_to_show = [c for c in ["brand","model","year","price_eur_str","km_driven"] if c in tmp.columns]
+        st.dataframe(tmp[cols_to_show], width="stretch", hide_index=True)
         st.caption(caption_text)
 
 
@@ -1102,6 +1184,50 @@ elif section == "Classification" and role == "owner":
     show_block(class_b, "### Class B — Good Deals", "All vehicles within the 0.5–0.7 range.")
     st.divider()
     show_block(class_c, "### Class C — Fair/Poor Deals", "All vehicles below 0.5.")
+
+elif section == "Demand" and role == "owner":
+    st.subheader("🔥 Demand Radar")
+
+    hedonic = load_hedonic_model()
+    if hedonic is None:
+        st.info("Need at least price_eur, year (km/brand/body/fuel/transmission/model improve accuracy).")
+        st.stop()
+
+    # --- Brand filter only ---
+    brand_pick = st.multiselect(
+        "Brands",
+        sorted(df["brand"].dropna().unique()) if "brand" in df.columns else [],
+    )
+
+    base = df.copy()
+    if brand_pick and "brand" in base.columns:
+        base = base[base["brand"].isin(brand_pick)]
+
+
+    res = compute_demand_index(base, hedonic)
+    if res is None or res.empty:
+        st.info("Couldn’t compute a demand index on the current slice.")
+        st.stop()
+
+    # Show top models by demand
+    # format & rename first
+    # --- pretty table (Demand section only) ---
+    res = res.copy()
+    res["median_price"] = res["median_price"].apply(_fmt_eur)
+    if "demand_index" in res.columns:
+        res["demand_index"] = res["demand_index"].round(3)
+
+    # exact columns to show (fall back safely if any are missing)
+    display_cols = [c for c in ["brand", "model", "median_price", "demand_index"] if c in res.columns]
+
+    st.dataframe(
+        res[display_cols].head(25),
+        width="stretch",
+        hide_index=True
+    )
+
+    st.caption("Demand Index blends scarcity (few listings), price premium vs. peers (positive residual), and soft desirability.")
+
     
 # ----------- Chat (customers) -----------
 elif section == "Chat" and role == "customer":
@@ -1168,7 +1294,7 @@ elif section == "Chat" and role == "customer":
     # tiny toolbar
     col_a, col_b = st.columns([0.8, 0.2])
     with col_b:
-        if st.button("Reset chat"):
+        if st.button("Reset chat", width="stretch", key="btn_reset_chat"):
             st.session_state["chat"] = []
             st.rerun()
 
@@ -1200,7 +1326,7 @@ elif section == "Chat" and role == "customer":
             st.markdown(ans_text)
             with st.expander("Data used for this answer", expanded=False):
                 # Show exactly what the model saw
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
         st.session_state["chat"].append(("assistant", ans_text))
 
@@ -1285,7 +1411,7 @@ elif section == "Clustering" and role == "customer":
         if col in summ.columns:
             show_cols.append(col)
 
-    st.dataframe(summ[show_cols], use_container_width=True, hide_index=True)
+    st.dataframe(summ[show_cols], width="stretch", hide_index=True)
 
     # 2.8 Let the user pick a cluster
     st.markdown("### Explore a Cluster")
@@ -1307,11 +1433,11 @@ elif section == "Clustering" and role == "customer":
         top_brands = (
             display["brand"].fillna("—").value_counts().rename_axis("brand").reset_index(name="count").head(6)
         )
-        st.dataframe(top_brands, use_container_width=True, hide_index=True)
+        st.dataframe(top_brands, width="stretch", hide_index=True)
 
     # 2.9 Show the cars table
     nicer_cols = [c for c in ["car","year","price_eur_str","km_driven","power_bhp","engine_cc","seats","fuel","transmission","body_norm","soft_buy_score"] if c in display.columns]
     if "price_eur" in display.columns:
         display = display.sort_values(["price_eur","year"] if "year" in display.columns else ["price_eur"], na_position="last")
-    st.dataframe(display[nicer_cols], use_container_width=True, hide_index=True)
+    st.dataframe(display[nicer_cols], width="stretch", hide_index=True)
     st.caption("Tip: tweak variables and filters above to reshape the clusters.")

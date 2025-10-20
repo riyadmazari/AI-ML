@@ -1,0 +1,1 @@
+{"feat_num": ["year", "mileage_val", "km_driven", "price_eur"], "feat_cat": ["model", "fuel", "transmission", "body_norm"]}
