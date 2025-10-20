@@ -1,0 +1,6 @@
+[theme]
+primaryColor = "#00B5E2"            # Cyan pops best on dark
+backgroundColor = "#0C0C0C"         # Black S900
+secondaryBackgroundColor = "#0C0C0C" # Slightly lighter for panels/cards
+textColor = "#FFFFFF"
+font = "sans serif"

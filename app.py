@@ -13,6 +13,23 @@ from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
 import joblib
 
+# ----- Altair brand theme -----
+brand_range = ["#4C12A1", "#00A74A", "#00B5E2", "#0C0C0C", "#F0F2F6"]
+alt.themes.register('movelit_dark', lambda: {
+    "config": {
+        "range": {
+            "category": ["#00B5E2", "#00A74A", "#4C12A1", "#FFFFFF", "#161616"],
+            "heatmap": ["#161616", "#00B5E2", "#00A74A"]
+        },
+        "title": {"fontSize": 16, "fontWeight": 700, "color": "#FFFFFF"},
+        "axis": {"labelColor": "#FFFFFF", "titleColor": "#FFFFFF"},
+        "legend": {"labelColor": "#FFFFFF", "titleColor": "#FFFFFF"}
+    }
+})
+alt.themes.enable('movelit_dark')
+
+
+
 # ---------- CONFIG ----------
 OPENAI_MODEL = "gpt-4o-mini"
 OPENAI_TEMPERATURE = 0.2
@@ -53,18 +70,156 @@ st.set_page_config(
 # ---------- Styling ----------
 st.markdown("""
 <style>
-[data-testid="collapsedControl"] { display: none; }
-section.main > div { padding-top: 0.5rem; }
-.top-nav button[kind="secondary"] {
-  border-radius: 9999px !important;
-  padding: 0.6rem 1.1rem !important;
-  font-weight: 600 !important;
-  border: 1px solid rgba(0,0,0,0.08) !important;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.05) !important;
+:root{
+  /* ===== Core brand ===== */
+  --brand-purple: #4C12A1;
+  --brand-green:  #00A74A;
+  --brand-cyan:   #00B5E2;
+  --ink-100:      #FFFFFF;
+  --ink-300:      rgba(255,255,255,0.70);
+  --ink-500:      rgba(255,255,255,0.55);
+  --paper-900:    #0C0C0C;
+  --paper-800:    #161616;
+  --paper-700:    #1F1F1F;
+
+  /* ===== Semantics ===== */
+  --primary:       var(--brand-cyan);
+  --primary-ink:   #0C0C0C;
+  --primary-soft:  rgba(0,181,226,0.15);
+  --primary-ring:  rgba(0,181,226,0.40);
+
+  --success:       var(--brand-green);
+  --success-soft:  rgba(0,167,74,0.20);
+  --info:          var(--brand-purple);
+  --info-soft:     rgba(76,18,161,0.25);
+  --warning:       #FFC247;
+  --warning-soft:  rgba(255,194,71,0.20);
+  --danger:        #E53935;
+  --danger-soft:   rgba(229,57,53,0.25);
+
+  --bd-soft:  rgba(255,255,255,0.08);
+  --bd-strong:rgba(255,255,255,0.15);
+  --elev-1:   0 1px 3px rgba(0,0,0,0.7);
+  --elev-2:   0 8px 24px rgba(0,0,0,0.6);
+
+  /* ===== Brand gradients ===== */
+  --grad-01: linear-gradient(90deg, #00B5E2 0%, #00A74A 100%);
+  --grad-02: linear-gradient(90deg, #00B5E2 0%, #4C12A1 100%);
+  --grad-03: linear-gradient(90deg, #00A74A 0%, #4C12A1 100%);
+  --grad-04: linear-gradient(90deg, #4C12A1 0%, #00A74A 100%);
 }
-.dataframe th, .dataframe td { font-size: 0.90rem; }
+
+/* ===== Canvas ===== */
+[data-testid="collapsedControl"] { display:none; }
+section.main > div { padding-top:.5rem; }
+body, .block-container { color: var(--ink-100); background: var(--paper-900); }
+.stApp header { background: var(--paper-900) !important; }
+
+/* ===== Panels / cards ===== */
+.stMarkdown, .stDataFrame, .stAlert, .stMetric, .stTable,
+div[data-testid="stVerticalBlock"]>div{
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  border-radius: 0 !important;
+}
+/* One clean card you can opt-in to */
+.card{
+  background: var(--paper-800);
+  border: 1px solid var(--bd-soft);
+  border-radius: 14px;
+  box-shadow: var(--elev-1);
+  padding: 1rem 1.25rem;
+}
+
+/* Bigger “hero” card for first screens */
+.card.hero{
+  padding: 1.5rem 1.75rem;
+  box-shadow: var(--elev-2);
+}
+div[data-testid="stMetric"]{ padding:.75rem 1rem; }
+
+/* ===== Buttons ===== */
+.stButton>button{
+  border-radius:9999px!important;
+  padding:.6rem 1.1rem!important;
+  font-weight:700!important;
+  border:1px solid var(--bd-soft)!important;
+  box-shadow:var(--elev-1)!important;
+}
+.stButton>button[kind="primary"]{
+  background:var(--primary)!important;
+  color:var(--primary-ink)!important;
+}
+.stButton>button[kind="secondary"]{
+  background:var(--paper-800)!important;
+  color:var(--ink-100)!important;
+}
+.stButton>button:hover{ filter:brightness(1.1); }
+.stButton>button:active{ transform:translateY(.5px); }
+
+/* ===== Badges ===== */
+.badge{display:inline-block;padding:.28rem .6rem;border-radius:999px;
+  font-size:.8rem;font-weight:700;letter-spacing:.2px;}
+.badge-success{background:var(--success);color:#0C0C0C;}
+.badge-info{background:var(--info);color:#FFFFFF;}
+.badge-warn{background:var(--warning);color:#0C0C0C;}
+.badge-danger{background:var(--danger);color:#FFFFFF;}
+
+/* ===== Tables ===== */
+.dataframe th{background:var(--paper-700);}
+.dataframe th,.dataframe td{border-color:var(--bd-soft)!important;color:var(--ink-100)!important;}
+.dataframe tr:nth-child(even) td{background:var(--paper-800);}
+.dataframe th,.dataframe td{font-size:.90rem;}
+
+/* ===== Inputs ===== */
+input,textarea,select,.stTextInput>div>div>input{
+  border-radius:10px!important;
+  border:1px solid var(--bd-soft)!important;
+  background:var(--paper-800)!important;
+  color:var(--ink-100)!important;
+}
+input:focus,textarea:focus,select:focus,.stTextInput:focus-within input{
+  outline:3px solid var(--primary-ring)!important;
+}
+
+/* ===== Progress / hr ===== */
+hr,.stProgress>div>div>div{
+  background:var(--grad-02)!important;
+  height:6px;border-radius:999px;
+}
+
+/* ===== Brand underline option ===== */
+.brand-underline{position:relative;display:inline-block;}
+.brand-underline:after{content:"";position:absolute;left:0;right:0;bottom:-6px;
+  height:6px;border-radius:999px;background:var(--grad-04);}
+
+/* ===== Center container layout ===== */
+.center-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;       /* center horizontally */
+  justify-content: center;   /* center vertically */
+  min-height: 85vh;          /* centers it in viewport height */
+  gap: 1rem;
+  text-align: center;
+}
+.center-container > * {
+  width: 100%;
+  max-width: 500px; /* adjust as you like */
+}
+
+/* Keep the whole app comfortably centered on wide displays */
+.block-container{
+  max-width: 980px;   /* tweak 880–1100 as you like */
+  margin: 0 auto;
+}
+
+
 </style>
 """, unsafe_allow_html=True)
+
+
 
 # ---------------- Data + ML helpers (unchanged from previous version) ----------------
 @st.cache_data
@@ -425,7 +580,12 @@ def run_clustering_flexible(df, numeric_cols, categorical_cols, k=5):
     pipe = Pipeline([("prep", pre), ("km", KMeans(n_clusters=k_eff, random_state=42, n_init="auto"))])
     labels = pipe.fit_predict(X)
     return pd.Series(labels, index=X.index, name="cluster")
-
+# nice formatter: €55 000.00 (space as thousands sep)
+def _fmt_eur(x):
+    try:
+        return "€{:,.2f}".format(float(x)).replace(",", " ")
+    except Exception:
+        return "€—"
 
 def summarize_clusters(df_run, labels, numeric_cols_selected, categorical_cols_selected):
     """
@@ -687,6 +847,7 @@ else:
 
 # ---------- Who are you? ----------
 if not st.session_state["role"]:
+
     st.subheader("Who are you?")
     col1, col2 = st.columns(2)
     with col1:
@@ -697,28 +858,54 @@ if not st.session_state["role"]:
         if st.button("Owner", width="stretch", key="btn_role_owner"):
             st.session_state.update(role="owner", authed=False)
             st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)  # /card
+
+    st.markdown('</div>', unsafe_allow_html=True)  # /center
     st.stop()
+
 
 # ---------- Owner login ----------
 if st.session_state["role"] == "owner" and not st.session_state["authed"]:
-    st.markdown("<br><br>", unsafe_allow_html=True)
-    center1, center2, center3 = st.columns([0.35, 0.3, 0.35])
-    with center2:
-        st.markdown("### Owner Login")
-        pwd = st.text_input("Password", type="password", label_visibility="collapsed")
-        if st.button("Unlock", type="primary"):
-            if pwd == OWNER_PASSWORD:
-                st.session_state.update(authed=True, section="Best Deals")
-                st.success("Access granted.")
-                st.rerun()
-            else:
-                st.error("Incorrect password.")
+
+    st.markdown("### Owner Login")
+    pwd = st.text_input("Password", type="password", label_visibility="collapsed")
+
+    if st.button("Unlock", type="primary"):
+        if pwd == OWNER_PASSWORD:
+            st.session_state.update(authed=True, section="Best Deals")
+            st.success("Access granted.")
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+    st.markdown('</div>', unsafe_allow_html=True)  # /card
+    st.markdown('</div>', unsafe_allow_html=True)  # /center
     st.stop()
+
+
 
 # ---------- After auth ----------
 df = load_data()
 if df.empty: st.stop()
 # --- Ensure Euro price exists & is numeric ---
+
+# --- Owner summary metrics ---
+if st.session_state["role"] == "owner":
+    try:
+        soft_col = pick_cols(df)["soft"]
+    except Exception:
+        soft_col = None
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Total listings", f"{len(df):,}")
+    with m2:
+        share_a = (df[soft_col] >= 0.7).mean() if soft_col in df.columns else 0
+        st.metric("Class A share", f"{share_a:.0%}")
+    with m3:
+        med_price = pd.to_numeric(df.get("price_eur"), errors="coerce").median()
+        st.metric("Median price", _fmt_eur(med_price) if not np.isnan(med_price) else "—")
+    st.markdown('</div>', unsafe_allow_html=True)
+
 
 if "price_eur" not in df.columns and "selling_price" in df.columns:
     # your rule: 5,500,000 -> €55,000.00  (divide by 100)
@@ -731,12 +918,6 @@ if "mileage_val" not in df.columns and "mileage" in df.columns:
     df["mileage_val"] = pd.to_numeric(m, errors="coerce")
 
 
-# nice formatter: €55 000.00 (space as thousands sep)
-def _fmt_eur(x):
-    try:
-        return "€{:,.2f}".format(float(x)).replace(",", " ")
-    except Exception:
-        return "€—"
 
 def _best_table(df_like: pd.DataFrame) -> pd.DataFrame:
     # exact order, but fall back safely if any column is missing
@@ -922,17 +1103,18 @@ if role == "owner":
 
     c1, c2, c3, c4 = st.columns([0.2, 0.2, 0.2, 0.4])
     with c1:
-        if st.button("Best Deals", type="secondary", width="stretch", key="nav_best"):
+        if st.button("Deals (ranked)", type="secondary", width="stretch", key="nav_best"):
             st.session_state["section"] = "Best Deals"; st.rerun()
     with c2:
-        if st.button("Classification", type="secondary", width="stretch", key="nav_class"):
+        if st.button("Deal Classes", type="secondary", width="stretch", key="nav_class"):
             st.session_state["section"] = "Classification"; st.rerun()
     with c3:
-        if st.button("Demand", type="secondary", width="stretch", key="nav_demand"):
+        if st.button("Demand Radar", type="secondary", width="stretch", key="nav_demand"):
             st.session_state["section"] = "Demand"; st.rerun()
     with c4:
-        if st.button("Add & Check Car", type="primary", width="stretch", key="nav_checkcar"):
+        if st.button("Add/Score a Car", type="primary", width="stretch", key="nav_checkcar"):
             st.session_state["show_check_modal"] = True
+
 
 else:
     if st.session_state["section"] not in ["Chat", "Clustering"]:
@@ -976,7 +1158,7 @@ def render_check_car_form():
             "Maruti","Mercedes-Benz","Mitsubishi","Nissan","Opel","Peugeot","Renault","Skoda",
             "Tata","Toyota","Volkswagen","Volvo"
         ]
-        brand = st.selectbox("brend", brands, index=21 if "Maruti" in brands else 0)
+        brand = st.selectbox("brand", brands, index=21 if "Maruti" in brands else 0)
 
         cta1, cta2, _ = st.columns([0.2, 0.2, 0.6])
         with cta1:
@@ -1106,19 +1288,34 @@ if section == "Best Deals" and role == "owner":
         st.info("soft_buy_score not found—showing a basic top list.")
         tmp = df.copy()  # already has reliable 'car'
         show_cols = [c for c in ["brand","model","year","price_eur_str","km_driven"] if c in tmp.columns]
-        st.dataframe(tmp.head(10)[show_cols], width="stretch", hide_index=True)
+        st.dataframe(tmp.head(10)[show_cols], use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
         st.stop()
 
 
     # --- Class A ---
     class_a = df[df[score_col] >= 0.7].copy()
-    st.markdown("### Class A — Premium Deals")
+    count_a = int((df[score_col] >= 0.7).sum())
+    
+    st.markdown(f"### Class A — Premium Deals ({count_a:,})")
+    st.markdown("**Legend** — A: ≥ 0.70 | B: 0.50–0.69 | C: < 0.50")
+    st.caption("Ranked by soft score ↓, then price ↑, then year ↓, then km ↑.")
+
     if class_a.empty:
         st.caption("No vehicles meet this criterion.")
     else:
         top_a = ensure_car_name(class_a.sort_values(score_col, ascending=False).head(10).copy())
         show_cols = [c for c in ["brand","model","year","price_eur_str","km_driven"] if c in top_a.columns]
         st.dataframe(top_a[show_cols], width="stretch", hide_index=True)
+        st.download_button(
+        "Download Class A (CSV)",
+        top_a[show_cols].to_csv(index=False).encode("utf-8"),
+        file_name="class_A_deals.csv",
+        mime="text/csv"
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
 
 
     # --- Class B ---
@@ -1136,30 +1333,30 @@ if section == "Best Deals" and role == "owner":
             else:
                 top_b["car"] = "—"
         show_cols = [c for c in ["brand","model","year","price_eur_str","km_driven"] if c in top_b.columns]
-        st.dataframe(top_b[show_cols], width="stretch", hide_index=True)
+        
+        st.dataframe(top_b[show_cols], use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Class B (CSV)",
+            top_b[show_cols].to_csv(index=False).encode("utf-8"),
+            file_name="class_B_deals.csv",
+            mime="text/csv"
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
 
 
 
 # ----------- Classification (owners) -----------
 elif section == "Classification" and role == "owner":
-
+    st.caption("Soft score = modelled desirability (0–1). Higher is better.")
     score_col = cols["soft"]
     if score_col not in df.columns:
         st.info("soft_buy_score not found—cannot classify.")
         st.stop()
 
     # Train model for optional probability (kept, but we won't display it here)
-    model = CLASSIFIER_MODEL_PATH
     slice_df = df.copy()
-    if model is not None:
-        try:
-            clf, feat_cols = model
-            mask = slice_df[feat_cols].notna().all(axis=1) if feat_cols else pd.Series(False, index=slice_df.index)
-            if mask.any():
-                probs = clf.predict_proba(slice_df.loc[mask, feat_cols])[:, 1]
-                slice_df.loc[mask, "good_deal_prob"] = np.round(probs, 3)
-        except Exception:
-            pass
 
     # Classes by soft_buy_score
     class_a = slice_df[slice_df[score_col] >= 0.7].sort_values(score_col, ascending=False).copy()
@@ -1168,14 +1365,19 @@ elif section == "Classification" and role == "owner":
 
     # We'll show only the requested columns
     def show_block(df_block, title, caption_text):
+        
         st.markdown(title)
         if df_block.empty:
             st.caption("No vehicles meet this criterion.")
+            st.markdown('</div>', unsafe_allow_html=True)
             return
-        tmp = ensure_car_name(df_block)  # standardize
+        tmp = ensure_car_name(df_block)
         cols_to_show = [c for c in ["brand","model","year","price_eur_str","km_driven"] if c in tmp.columns]
-        st.dataframe(tmp[cols_to_show], width="stretch", hide_index=True)
-        st.caption(caption_text)
+        st.dataframe(tmp[cols_to_show], use_container_width=True, hide_index=True)
+        st.caption(caption_text + " Ranked by score ↓, then price ↑, year ↓, km ↑.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
 
 
 
@@ -1184,9 +1386,13 @@ elif section == "Classification" and role == "owner":
     show_block(class_b, "### Class B — Good Deals", "All vehicles within the 0.5–0.7 range.")
     st.divider()
     show_block(class_c, "### Class C — Fair/Poor Deals", "All vehicles below 0.5.")
+    st.markdown("**Legend** — A: ≥ 0.70 | B: 0.50–0.69 | C: < 0.50")
+    st.caption("Soft score blends desirability signals from past good buys. Higher is better (0–1).")
+
 
 elif section == "Demand" and role == "owner":
     st.subheader("🔥 Demand Radar")
+    st.caption("Demand Index = 0.4×Scarcity + 0.4×Price Premium + 0.2×Desirability.")
 
     hedonic = load_hedonic_model()
     if hedonic is None:
@@ -1195,9 +1401,21 @@ elif section == "Demand" and role == "owner":
 
     # --- Brand filter only ---
     brand_pick = st.multiselect(
-        "Brands",
+        "Filter by brand (optional)",
         sorted(df["brand"].dropna().unique()) if "brand" in df.columns else [],
     )
+    c1, c2 = st.columns([0.85, 0.15])
+    with c1:
+        if brand_pick:
+            st.caption(f"Showing demand for {len(brand_pick)} brand(s). Sorted by demand_index ↓.")
+        else:
+            st.caption("No brand filter applied. Sorted by demand_index ↓.")
+    with c2:
+        if st.button("Reset", use_container_width=True):
+            # clear selection & rerun
+            st.session_state.pop("Filter by brand (optional)", None)
+            st.rerun()
+
 
     base = df.copy()
     if brand_pick and "brand" in base.columns:
@@ -1215,16 +1433,19 @@ elif section == "Demand" and role == "owner":
     res = res.copy()
     res["median_price"] = res["median_price"].apply(_fmt_eur)
     if "demand_index" in res.columns:
-        res["demand_index"] = res["demand_index"].round(3)
+        di = pd.to_numeric(res["demand_index"], errors="coerce") \
+                .replace([np.inf, -np.inf], np.nan) \
+                .fillna(0.0)
+        # Clamp to [0,100] just for the bar length
+        res["_demand_bar"] = (di * 100).clip(0, 100).round().astype(int).apply(lambda x: "█" * (x // 5))
 
-    # exact columns to show (fall back safely if any are missing)
-    display_cols = [c for c in ["brand", "model", "median_price", "demand_index"] if c in res.columns]
+    display_cols = [c for c in ["brand","model","median_price","demand_index","_demand_bar"] if c in res.columns]
 
-    st.dataframe(
-        res[display_cols].head(25),
-        width="stretch",
-        hide_index=True
-    )
+
+    
+    st.dataframe(res[display_cols].head(25), use_container_width=True, hide_index=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
 
     st.caption("Demand Index blends scarcity (few listings), price premium vs. peers (positive residual), and soft desirability.")
 
@@ -1326,7 +1547,10 @@ elif section == "Chat" and role == "customer":
             st.markdown(ans_text)
             with st.expander("Data used for this answer", expanded=False):
                 # Show exactly what the model saw
-                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
 
         st.session_state["chat"].append(("assistant", ans_text))
 
@@ -1411,7 +1635,9 @@ elif section == "Clustering" and role == "customer":
         if col in summ.columns:
             show_cols.append(col)
 
-    st.dataframe(summ[show_cols], width="stretch", hide_index=True)
+    
+    st.dataframe(summ[show_cols], use_container_width=True, hide_index=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
     # 2.8 Let the user pick a cluster
     st.markdown("### Explore a Cluster")
@@ -1433,11 +1659,17 @@ elif section == "Clustering" and role == "customer":
         top_brands = (
             display["brand"].fillna("—").value_counts().rename_axis("brand").reset_index(name="count").head(6)
         )
-        st.dataframe(top_brands, width="stretch", hide_index=True)
+        
+        st.dataframe(top_brands, use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
 
     # 2.9 Show the cars table
     nicer_cols = [c for c in ["car","year","price_eur_str","km_driven","power_bhp","engine_cc","seats","fuel","transmission","body_norm","soft_buy_score"] if c in display.columns]
     if "price_eur" in display.columns:
         display = display.sort_values(["price_eur","year"] if "year" in display.columns else ["price_eur"], na_position="last")
-    st.dataframe(display[nicer_cols], width="stretch", hide_index=True)
+    
+    st.dataframe(display[nicer_cols], use_container_width=True, hide_index=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
     st.caption("Tip: tweak variables and filters above to reshape the clusters.")
