@@ -15,13 +15,23 @@ import joblib
 OPENAI_MODEL = "gpt-4o-mini"
 OPENAI_TEMPERATURE = 0.2
 SYSTEM_PROMPT = (
-    "You are DealBot, an expert assistant for a car dealership. "
-    "Use ONLY the provided data context. Be concise (max 5 short lines)."
+    "You are DealBot, a car-dealer assistant.\n"
+    "You will receive JSON with {schema, rows, question}.\n"
+    "- Use ONLY the provided 'rows'. If the answer isn't implied by them, reply exactly: 'Not in this dataset.'\n"
+    "- When referring to price, ALWAYS use 'price_eur' (numeric) or 'price_eur_str' (already formatted). "
+    "NEVER use 'selling_price' or show '₹'.\n"
+    "- For the car label, use the 'car' column EXACTLY as given; do not prepend/duplicate brand/model.\n"
+    "- If the question mentions a body style (SUV, sedan, hatchback, pickup, wagon, convertible, MPV), "
+    "filter by 'body_norm' or mapped synonyms in schema.synonyms when present.\n"
+    "- For 'best'/'top' ranking: sort by soft_buy_score ↓, then price_eur ↑, then year ↓, then km_driven ↑ when present.\n"
+    "- If the user asks for N items, return up to N.\n"
+    "- Be concise (≤ 5 short lines) and cite car name/year/price from the rows."
 )
-DATA_PATH = "exports/final_model_dataset.csv"
+DATA_PATH = "exports/final_enriched_full.csv"  # <-- merged file with names
 TOP_N = 20
 GOOD_DEAL_THRESHOLD = 0.80
 OWNER_PASSWORD = "123"
+FIXED_K = 5    # fixed number of clusters for customers
 # ----------------------------
 
 try:
@@ -65,26 +75,167 @@ def load_data():
 def pick_cols(df):
     f = lambda cands: next((c for c in cands if c in df.columns), None)
     return dict(
-        price=f(["selling_price","price"]), year=f(["year"]),
+        price=f(["price_eur", "selling_price", "price"]),
+        year=f(["year"]),
         make=f(["make","manufacturer"]), model=f(["model"]),
-        mileage=f(["mileage","mileage_val"]), km=f(["km_driven","kilometers","km"]),
+        mileage=f(["mileage_val", "mileage"]),     # ← swapped order here
+        km=f(["km_driven","kilometers","km"]),
         power=f(["power_bhp","power"]), fuel=f(["fuel"]),
         trans=f(["transmission","gearbox"]), body=f(["body_type","type"]),
         soft=f(["soft_buy_score","softbuy_score","soft_score"])
     )
+
+
+def ensure_car_name(df: pd.DataFrame) -> pd.DataFrame:
+    """Create/repair a single 'car' column for display using name/brand/model fallbacks."""
+    out = df.copy()
+
+    def _clean(s: pd.Series) -> pd.Series:
+        # normalize text and collapse placeholders to empty
+        s = s.astype(str).str.strip()
+        placeholders = {"nan", "none", "null", "na", "n/a", "-", "—"}
+        return s.apply(lambda x: "" if x.lower() in placeholders else x)
+
+    for c in ["car", "name", "brand", "model"]:
+        if c in out.columns:
+            out[c] = _clean(out[c])
+
+    # start from existing car (cleaned), else empty series
+    base = out["car"] if "car" in out.columns else pd.Series("", index=out.index)
+
+    # prefer 'name' where base is empty/placeholder
+    if "name" in out.columns:
+        empty_mask = base.eq("")
+        base = base.where(~empty_mask, out["name"])
+
+    # then brand + model
+    if {"brand", "model"}.issubset(out.columns):
+        bm = (out["brand"].fillna("") + " " + out["model"].fillna("")).str.strip()
+        empty_mask = base.eq("")
+        base = base.where(~empty_mask, bm)
+
+    # or brand alone
+    if "brand" in out.columns:
+        empty_mask = base.eq("")
+        base = base.where(~empty_mask, out["brand"])
+
+    out["car"] = base.replace("", "—")
+    return out
+
+# ---------- Chat helpers: parse & answer from the dataframe (v2) ----------
+_NUMBER_RE = re.compile(r"\d[\d,\.]*")
+
+def _to_num(x):
+    try:
+        if isinstance(x, str):
+            x = x.replace(",", "").replace(" ", "")
+        return float(x)
+    except Exception:
+        return None
+
+def _extract_first_number(txt):
+    s = txt.lower()
+    # Normalize common units into plain numbers
+    s = re.sub(r"(\d+)\s*(lakh|lakhs)\b",   lambda m: str(int(m.group(1)) * 100000), s)
+    s = re.sub(r"(\d+)\s*(crore|cr)\b",     lambda m: str(int(m.group(1)) * 10000000), s)
+    s = re.sub(r"(\d+)\s*(million|mn|m)\b", lambda m: str(int(m.group(1)) * 1000000), s)
+    s = re.sub(r"(\d+)\s*k\b",              lambda m: str(int(m.group(1)) * 1000), s)
+    m = _NUMBER_RE.search(s)
+    return _to_num(m.group(0)) if m else None
+
+def _extract_top_n(txt, default=None):
+    """
+    Look for 'top 10', 'show 8', 'list 3 cars', etc.
+    Returns an int or None if user didn't ask for a specific N.
+    """
+    m = re.search(r"\btop\s+(\d+)\b", txt)
+    if m: return int(m.group(1))
+    m = re.search(r"\bshow\s+(\d+)\b", txt)
+    if m: return int(m.group(1))
+    m = re.search(r"\blist\s+(\d+)\b", txt)
+    if m: return int(m.group(1))
+    m = re.search(r"\b(\d+)\s+cars?\b", txt)
+    if m: return int(m.group(1))
+    return default
+
+def _canon_cols(df, cols):
+    return dict(
+        price = cols["price"] if cols["price"] in df.columns else None,
+        year  = cols["year"] if cols["year"] in df.columns else None,
+        km    = cols["km"] if cols["km"] in df.columns else None,
+        power = cols["power"] if cols["power"] in df.columns else None,
+        soft  = cols["soft"] if cols["soft"] in df.columns else None,
+        brand = "brand" if "brand" in df.columns else None,
+        model = "model" if "model" in df.columns else None,
+        car   = "car" if "car" in df.columns else None,
+        fuel  = cols["fuel"] if cols["fuel"] in df.columns else None,
+        trans = cols["trans"] if cols["trans"] in df.columns else None,
+        name  = "name" if "name" in df.columns else None,
+        body  = cols["body"] if cols["body"] in df.columns else None,
+        make  = cols["make"] if cols["make"] in df.columns else None,
+        mileage = cols["mileage"] if cols["mileage"] in df.columns else None,
+    )
+
+
+STOPWORDS = {
+    "what","whats","which","is","are","the","a","an","for","show","list","top","best","good",
+    "with","and","or","of","to","please","give","find","me","under","over","between","vs",
+    "any","then","buy"
+}
+
+def _model_tokens(ql: str):
+    toks = re.findall(r"[a-z0-9\-]+", ql)
+    return [t for t in toks if len(t) >= 2 and t not in STOPWORDS]
+
+def _apply_text_filter_on_model(df, ql, c, brand_already_applied: bool):
+    """
+    Try to narrow by tokens against car/name/model, but ONLY if at least one token hits.
+    - Do NOT remove brand tokens unless a brand filter was already applied.
+    - If no token hits any row, return the original df (no filtering).
+    """
+    cols = [x for x in [c.get("car"), c.get("name"), c.get("model")] if x]
+    if not cols:
+        return df, None
+
+    blob = df[cols].astype(str).agg(" ".join, axis=1).str.lower()
+    tokens = _model_tokens(ql)
+
+    # If brand wasn't already filtered, keep brand words in tokens
+    if brand_already_applied and "brand" in df.columns:
+        brands_low = {str(b).lower() for b in df["brand"].dropna().unique()}
+        tokens = [t for t in tokens if t not in brands_low]
+
+    if not tokens:
+        return df, None
+
+    # Keep only tokens that actually hit at least one row
+    tokens_that_hit = [t for t in tokens if blob.str.contains(re.escape(t), na=False).any()]
+    if not tokens_that_hit:
+        # Nothing in the dataset matches any token -> don't filter; let other logic handle it.
+        return df, None
+
+    # Require all hitting tokens to be present in a row
+    mask = pd.Series(True, index=df.index)
+    for t in tokens_that_hit:
+        mask &= blob.str.contains(re.escape(t), na=False)
+
+    filtered = df.loc[mask]
+    note = "model/name contains: " + ", ".join(tokens_that_hit[:5]) + (" …" if len(tokens_that_hit) > 5 else "")
+    return filtered, note
+
 
 def summarize_table(df, c, k=TOP_N):
     score = c["soft"]
     sort_cols = [score] if score in df.columns else ([c["price"]] if c["price"] in df.columns else [df.columns[0]])
     asc = [False] if score in df.columns else [True]
     tbl = df.sort_values(sort_cols, ascending=asc).head(k)
-    show_cols = [x for x in [c["year"], c["make"], c["model"], c["price"], c["mileage"], c["km"], score] if x in tbl.columns]
+    show_cols = [x for x in [c["year"], c.get("make"), c["model"], c["price"], c.get("mileage"), c["km"], score] if x in tbl.columns]
     return tbl[show_cols] if show_cols else tbl.head(k)
 
 def relevant_rows(df, query, c, limit=25):
     if df.empty or not query or not query.strip(): return df.head(limit)
     q = query.lower()
-    text_cols = [x for x in [c["make"], c["model"], c["fuel"], c["trans"], c["body"]] if x in df.columns]
+    text_cols = [x for x in [c.get("make"), c["model"], c["fuel"], c["trans"], c["body"]] if x in df.columns]
     text_cols += [x for x in df.columns if df[x].dtype == object]
     text_cols = list(dict.fromkeys(text_cols))[:8]
     temp = df.copy()
@@ -97,24 +248,308 @@ def relevant_rows(df, query, c, limit=25):
     temp["_rel"] = score
     return df.loc[temp.sort_values("_rel", ascending=False).head(limit).index]
 
-def to_context(df, c, n=15):
-    keep = [x for x in [c["year"], c["make"], c["model"], c["price"], c["mileage"], c["km"], c["soft"]] if x in df.columns]
+def to_context(df, c, n=30):
+    candidate_cols = [
+        "id_placeholder",        # will be removed; we insert id later
+        "car","brand","model","year",
+        "price_eur","price_eur_str",   # <— Euro fields only
+        "km_driven","soft_buy_score","power_bhp","engine_cc",
+        c.get("mileage") or "mileage_val",
+        "fuel","transmission",
+        "body_norm"
+    ]
+    keep = [col for col in candidate_cols if isinstance(col, str) and col in df.columns]
     small = df[keep].head(n).reset_index(drop=True)
     small.insert(0, "id", small.index + 1)
     return small.to_dict(orient="records")
 
-def ask_openai(msg, rows):
+
+    
+def ask_llm_with_schema(schema, rows, question):
     if client is None:
         return "Chat unavailable (OpenAI client not initialized)."
-    content = "Dataset sample:\n" + json.dumps(rows, ensure_ascii=False) + "\n\nUser question:\n" + msg
+    payload = {"schema": schema, "rows": rows, "question": question}
     try:
         resp = client.chat.completions.create(
-            model=OPENAI_MODEL, temperature=OPENAI_TEMPERATURE,
-            messages=[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":content}],
+            model=OPENAI_MODEL,
+            temperature=OPENAI_TEMPERATURE,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": json.dumps(payload, ensure_ascii=False)}
+            ],
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
         return f"Error: {e}"
+
+# ========= NEW: flexible clustering helpers =========
+def build_variable_catalog(df, cols):
+    """Return the variables customers care most about, with UI metadata."""
+    cat = {}
+
+    # Numeric (prefer your canonical columns)
+    if "year" in df.columns:
+        cat["Year"] = {"key":"year", "type":"numeric"}
+    if "price_eur" in df.columns:
+        cat["Price (EUR)"] = {"key":"price_eur", "type":"numeric"}
+    if cols.get("km") in df.columns:
+        cat["Mileage (km_driven)"] = {"key": cols["km"], "type":"numeric"}
+    if "power_bhp" in df.columns:
+        cat["Power (bhp)"] = {"key":"power_bhp", "type":"numeric"}
+    if "engine_cc" in df.columns:
+        cat["Engine (cc)"] = {"key":"engine_cc", "type":"numeric"}
+    if "seats" in df.columns:
+        cat["Seats"] = {"key":"seats", "type":"numeric"}
+
+    # Categorical
+    if "brand" in df.columns:
+        cat["Brand"] = {"key":"brand", "type":"categorical"}
+    if "fuel" in df.columns:
+        cat["Fuel"] = {"key":"fuel", "type":"categorical"}
+    if "transmission" in df.columns:
+        cat["Transmission"] = {"key":"transmission", "type":"categorical"}
+    # Use normalized body if available
+    if "body_norm" in df.columns:
+        cat["Body"] = {"key":"body_norm", "type":"categorical"}
+
+    # Optional extras if you have them
+    if "owner" in df.columns:
+        cat["Owner"] = {"key":"owner", "type":"categorical"}
+    if "seller_type" in df.columns:
+        cat["Seller Type"] = {"key":"seller_type", "type":"categorical"}
+
+    return cat
+
+def render_filters_ui(df, picked_vars, catalog):
+    """
+    Build per-variable filters UI and return a dict of {key: filter_spec}.
+    For numeric: (min, max). For categorical: list of chosen categories (or all).
+    """
+    import streamlit as st
+    filters = {}
+    for label in picked_vars:
+        meta = catalog[label]
+        key = meta["key"]
+        if meta["type"] == "numeric" and key in df.columns:
+            s = pd.to_numeric(df[key], errors="coerce")
+            s = s.dropna()
+            if s.empty: 
+                continue
+            lo, hi = float(s.min()), float(s.max())
+            # Nicer bounds for price
+            step = 1.0
+            if key == "price_eur":
+                step = max(100.0, (hi - lo) / 100.0)
+            v1, v2 = st.slider(
+                f"{label} range", 
+                min_value=float(lo), max_value=float(hi),
+                value=(float(lo), float(hi)), step=step
+            )
+            filters[key] = ("range", (v1, v2))
+        elif meta["type"] == "categorical" and key in df.columns:
+            choices = sorted([c for c in df[key].dropna().unique().tolist()])
+            picked = st.multiselect(f"{label} (choose one or more)", choices, default=choices)
+            filters[key] = ("in", picked)
+    return filters
+
+def apply_filters(df, filters):
+    out = df.copy()
+    for key, (ftype, spec) in filters.items():
+        if ftype == "range":
+            lo, hi = spec
+            out = out[(pd.to_numeric(out[key], errors="coerce") >= lo) &
+                      (pd.to_numeric(out[key], errors="coerce") <= hi)]
+        elif ftype == "in":
+            # keep all if user left default (all values)
+            if spec:
+                out = out[out[key].isin(spec)]
+    return out
+
+def run_clustering_flexible(df, numeric_cols, categorical_cols, k=5):
+    """
+    KMeans on a mixed feature space (scaled numeric + OHE categorical).
+    Returns: labels (Series aligned to df.index)
+    """
+    if df.empty:
+        return None
+
+    use_cols = [c for c in (numeric_cols + categorical_cols) if c in df.columns]
+    if not use_cols:
+        return None
+
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+    from sklearn.pipeline import Pipeline
+    from sklearn.cluster import KMeans
+
+    num_cols = [c for c in numeric_cols if c in df.columns]
+    cat_cols = [c for c in categorical_cols if c in df.columns]
+
+    X = df[use_cols].copy()
+    for c in num_cols:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+    X = X.dropna(subset=num_cols) if num_cols else X
+    if X.empty:
+        return None
+
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(), num_cols) if num_cols else ("num", "drop", []),
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols) if cat_cols else ("cat","drop",[]),
+        ]
+    )
+    pipe = Pipeline([("prep", pre), ("km", KMeans(n_clusters=k, random_state=42, n_init="auto"))])
+    labels = pipe.fit_predict(X)
+    out = pd.Series(labels, index=X.index, name="cluster")
+    return out
+
+def summarize_clusters(df_run, labels, numeric_cols_selected, categorical_cols_selected):
+    """
+    df_run: the filtered dataset being clustered (after user filters)
+    labels: pd.Series of cluster ids (index aligned with df_run)
+    numeric_cols_selected: list of numeric variables the user picked for clustering/labeling
+    categorical_cols_selected: list of categorical variables the user picked
+    """
+    if labels is None or labels.empty:
+        return pd.DataFrame()
+
+    base = df_run.loc[labels.index].copy()
+    base["cluster"] = labels.values
+
+    # ensure numeric
+    for c in numeric_cols_selected:
+        if c in base.columns:
+            base[c] = pd.to_numeric(base[c], errors="coerce")
+
+    # compute 5-bucket cutpoints on current working set
+    qs = _quantiles_for(base, numeric_cols_selected)
+
+    parts = []
+    for cid, g in base.groupby("cluster"):
+        row = {"cluster": int(cid), "count": int(len(g))}
+        # medians for selected numeric
+        numeric_medians = {}
+        for c in numeric_cols_selected:
+            if c in g.columns:
+                med = g[c].median(skipna=True)
+                numeric_medians[c] = med
+                row[c + "_median"] = med
+
+        # top for selected categoricals
+        top_cats = {}
+        for c in categorical_cols_selected:
+            if c in g.columns and not g[c].dropna().empty:
+                tv = g[c].mode(dropna=True).iloc[0]
+                top_cats[c] = tv
+                row[c + "_top"] = tv
+            else:
+                row[c + "_top"] = None
+
+        # pretty € median if present
+        if "price_eur" in numeric_cols_selected and "price_eur_median" in row and pd.notna(row["price_eur_median"]):
+            row["price_eur_median_str"] = _fmt_eur(row["price_eur_median"])
+
+        # human label (ONLY selected vars)
+        row["label"] = _fmt_label_parts_selected(numeric_cols_selected, categorical_cols_selected,
+                                                 numeric_medians, qs, top_cats)
+        parts.append(row)
+
+    summ = pd.DataFrame(parts).sort_values("cluster").reset_index(drop=True)
+    return summ
+
+
+# ========= 5-bucket labeling (only for selected variables) =========
+
+def _quantiles_for(df, cols, q=(0.1, 0.33, 0.66, 0.9)):
+    """
+    Return cut points {col: (q10, q33, q66, q90)} for numeric columns on the current working set.
+    """
+    qs = {}
+    for c in cols:
+        if c in df.columns:
+            s = pd.to_numeric(df[c], errors="coerce").dropna()
+            if len(s) >= 10:
+                qs[c] = tuple(float(s.quantile(x)) for x in q)
+    return qs
+
+def _bucket5(val, q10, q33, q66, q90):
+    if val is None or pd.isna(val): return "mid"
+    if val <= q10: return "very_low"
+    if val <= q33: return "low"
+    if val <= q66: return "mid"
+    if val <= q90: return "high"
+    return "very_high"
+
+def _pretty5(col, b):
+    # Customize per variable
+    if col == "year":
+        M = {"very_low":"Very old","low":"Old","mid":"Mid-age","high":"New","very_high":"Very new"}
+        return M[b]
+    if col == "price_eur":
+        M = {"very_low":"Ultra-budget","low":"Budget","mid":"Mid-price","high":"Premium","very_high":"Ultra-premium"}
+        return M[b]
+    if col == "km_driven":
+        M = {"very_low":"Very low miles","low":"Low miles","mid":"Mid miles","high":"High miles","very_high":"Very high miles"}
+        return M[b]
+    if col == "power_bhp":
+        M = {"very_low":"Very low power","low":"Low power","mid":"Mid power","high":"High power","very_high":"Very high power"}
+        return M[b]
+    if col == "engine_cc":
+        M = {"very_low":"Very small engine","low":"Small engine","mid":"Mid engine","high":"Large engine","very_high":"Very large engine"}
+        return M[b]
+    if col == "seats":
+        M = {"very_low":"Very few seats","low":"Few seats","mid":"Standard seats","high":"Many seats","very_high":"Very many seats"}
+        return M[b]
+    # fallback
+    return f"{col}:{b}"
+
+def _fmt_label_parts_selected(selected_numeric, selected_cats, numeric_medians, qs, top_cats):
+    """
+    Build label using ONLY variables the user selected.
+    - numeric: 5-bucket words
+    - categorical: top category (body_norm/fuel/transmission/brand etc.) but only if selected
+    """
+    parts = []
+
+    # order for readability; include only those that were selected
+    ordered_numeric = [c for c in ["year","price_eur","km_driven","power_bhp","engine_cc","seats"]
+                       if c in selected_numeric]
+
+    for col in ordered_numeric:
+        med = numeric_medians.get(col, None)
+        if col in qs and med is not None:
+            q10, q33, q66, q90 = qs[col]
+            b = _bucket5(med, q10, q33, q66, q90)
+            parts.append(_pretty5(col, b))
+
+    # reasonable order for cats; include only selected
+    ordered_cats = [c for c in ["body_norm","fuel","transmission","brand"] if c in selected_cats]
+    for col in ordered_cats:
+        topv = top_cats.get(col, None)
+        if topv:
+            if col == "body_norm":
+                parts.append(str(topv).upper() if str(topv).lower() in {"suv","mpv"} else str(topv).title())
+            else:
+                parts.append(str(topv))
+
+    # keep concise
+    return " • ".join(parts[:4]) if parts else ""
+
+
+
+def top_categories_series(df, labels, col, topn=6):
+    """Return a small frame of top categories for a given column within a cluster."""
+    base = df.loc[labels.index].copy()
+    base["cluster"] = labels.values
+    frames = {}
+    if col not in base.columns:
+        return frames
+    for cid, g in base.groupby("cluster"):
+        vc = (g[col].fillna("—").value_counts().rename_axis(col).reset_index(name="count").head(topn))
+        frames[int(cid)] = vc
+    return frames
+
+
 
 def run_clustering(df, feature_cols, k=4):
     try:
@@ -144,31 +579,115 @@ def name_clusters(centers):
         names[i] = " / ".join(tags)
     return names
 
+def cluster_labels_from_centers(centers: pd.DataFrame) -> dict:
+    """
+    Turn cluster centers into friendly labels using quantiles across available metrics.
+    Example output: 'New • Low miles • Budget • Mid power'
+    """
+    if centers is None or centers.empty:
+        return {}
+
+    label_cols = [c for c in ["year", "price_eur_str", "km_driven", "power_bhp"] if c in centers.columns]
+    if not label_cols:
+        return {int(r["cluster"]): f"Cluster {int(r['cluster'])}" for _, r in centers.iterrows()}
+
+    # Compute global quantiles per feature for bucketing
+    qs = {}
+    for c in label_cols:
+        qs[c] = centers[c].quantile([0.33, 0.66]).values.tolist()  # [low, high]
+
+    def bucket(cname, val):
+        low, high = qs[cname]
+        if val <= low: return "low"
+        if val >= high: return "high"
+        return "mid"
+
+    def pretty(cname, b):
+        if cname == "year":
+            return {"low":"Old", "mid":"Mid-age", "high":"New"}[b]
+        if cname == "price_eur_str":
+            return {"low":"Budget", "mid":"Mid-price", "high":"Premium"}[b]
+        if cname == "km_driven":
+            return {"low":"Low miles", "mid":"Mid miles", "high":"High miles"}[b]
+        if cname == "power_bhp":
+            return {"low":"Low power", "mid":"Mid power", "high":"High power"}[b]
+        return f"{cname}:{b}"
+
+    labels = {}
+    for _, row in centers.iterrows():
+        parts = []
+        for c in ["year", "price_eur_str", "km_driven", "power_bhp"]:
+            if c in centers.columns:
+                parts.append(pretty(c, bucket(c, row[c])))
+        labels[int(row["cluster"])] = " • ".join(parts) if parts else f"Cluster {int(row['cluster'])}"
+    return labels
+
+def representative_rows(df_with_cluster, clus_col="cluster", n=8):
+    """
+    For each cluster, pick a few representatives nearest the cluster median on available key fields.
+    """
+    out = {}
+    by = [c for c in ["year", "price_eur", "km_driven", "power_bhp"] if c in df_with_cluster.columns]
+    if not by:
+        for cid, g in df_with_cluster.groupby(clus_col):
+            out[int(cid)] = g.head(min(n, len(g)))
+        return out
+
+    for cid, g in df_with_cluster.groupby(clus_col):
+        med = g[by].median(numeric_only=True)
+        dist = ((g[by] - med).abs()).sum(axis=1)
+        out[int(cid)] = g.loc[dist.nsmallest(n).index]
+    return out
+
+
 @st.cache_resource
 def train_classifier(df, c):
-    score = c["soft"]
-    if score not in df.columns: return None
-    y_raw = df[score].copy()
-    if set(pd.Series(y_raw.dropna().unique()).astype(int)).issubset({0,1}) and y_raw.dropna().isin([0,1]).all():
-        y = y_raw.astype(int)
-    else:
-        y = (y_raw >= GOOD_DEAL_THRESHOLD).astype(int)
-    feat_num = [x for x in [c["year"], c["mileage"], c["km"], c["price"]] if x in df.columns]
-    feat_cat = [x for x in [c["make"], c["model"], c["fuel"], c["trans"], c["body"]] if x in df.columns]
-    if not feat_num and not feat_cat: return None
     from sklearn.compose import ColumnTransformer
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
     from sklearn.linear_model import LogisticRegression
+
+    score = c["soft"]
+    if score not in df.columns:
+        return None
+
+    # 1) Clean target: coerce to numeric, drop non-finite
+    y_num = pd.to_numeric(df[score], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    # 2) Decide if it's already 0/1 or needs thresholding
+    uniq = set(pd.unique(y_num.dropna()))
+    is_binary = uniq.issubset({0, 1})
+    y = (y_num >= GOOD_DEAL_THRESHOLD).astype(int) if not is_binary else y_num.astype(int)
+
+    # 3) Features
+    feat_num = [x for x in [c["year"], c.get("mileage"), c["km"], c["price"]] if x in df.columns]
+    feat_cat = [x for x in [c.get("make"), c["model"], c["fuel"], c["trans"], c["body"]] if x in df.columns]
+    if not feat_num and not feat_cat:
+        return None
+
     pre = ColumnTransformer([
-        ("num", StandardScaler(), feat_num) if feat_num else ("num","drop",[]),
-        ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=0.02), feat_cat) if feat_cat else ("cat","drop",[]),
+        ("num", StandardScaler(), feat_num) if feat_num else ("num", "drop", []),
+        ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=0.02), feat_cat) if feat_cat else ("cat", "drop", []),
     ])
-    safe = df.dropna(subset=feat_num + feat_cat).copy()
-    if safe.empty: return None
+
+    # 4) Build safe training frame (numeric coercion, drop NA, sync y)
+    safe = df.copy()
+    for col in feat_num:
+        safe[col] = pd.to_numeric(safe[col], errors="coerce")
+    safe.replace([np.inf, -np.inf], np.nan, inplace=True)
+    safe = safe.dropna(subset=(feat_num + feat_cat))
+
+    # Align y to safe rows and drop any remaining NaNs in y
+    y_aligned = y.loc[safe.index].dropna()
+    safe = safe.loc[y_aligned.index]
+
+    if safe.empty:
+        return None
+
     clf = Pipeline([("prep", pre), ("clf", LogisticRegression(max_iter=1000))])
-    clf.fit(safe[feat_num + feat_cat], y.loc[safe.index])
+    clf.fit(safe[feat_num + feat_cat], y_aligned.astype(int))
     return clf, feat_num + feat_cat
+
 
 # ==================== ROLE GATE ====================
 st.session_state.setdefault("role", None)
@@ -224,60 +743,94 @@ if st.session_state["role"] == "owner" and not st.session_state["authed"]:
 # ---------- After auth ----------
 df = load_data()
 if df.empty: st.stop()
+# --- Ensure Euro price exists & is numeric ---
+
+if "price_eur" not in df.columns and "selling_price" in df.columns:
+    # your rule: 5,500,000 -> €55,000.00  (divide by 100)
+    df["price_eur"] = pd.to_numeric(df["selling_price"], errors="coerce") / 100.0
+    
+# --- Normalize mileage to a numeric column ---
+if "mileage_val" not in df.columns and "mileage" in df.columns:
+    # extract the leading number from strings like "23.4 kmpl", "18 km/l", etc.
+    m = df["mileage"].astype(str).str.extract(r'([\d\.]+)', expand=False)
+    df["mileage_val"] = pd.to_numeric(m, errors="coerce")
+
+
+# nice formatter: €55 000.00 (space as thousands sep)
+def _fmt_eur(x):
+    try:
+        return "€{:,.2f}".format(float(x)).replace(",", " ")
+    except Exception:
+        return "€—"
+
+df["price_eur_str"] = df["price_eur"].apply(_fmt_eur) if "price_eur" in df.columns else "€—"
+
+df = ensure_car_name(df)
 cols = pick_cols(df)
 st.caption(f"Loaded **{DATA_PATH}** — {df.shape[0]:,} rows")
 
-def add_brend_and_standardize(df: pd.DataFrame) -> pd.DataFrame:
-    """Create df['brend'] from one-hot make_* columns and ensure the requested columns exist."""
-    df2 = df.copy()
 
-    # Pretty brand list (as you'd like it shown)
-    brands_pretty = [
-        "Ambassador","Ashok","Audi","BMW","Chevrolet","Daewoo","Datsun","Fiat","Force","Ford",
-        "Honda","Hyundai","Isuzu","Jaguar","Jeep","Kia","Land Rover","Lexus","MG","Mahindra",
-        "Maruti","Mercedes-Benz","Mitsubishi","Nissan","Opel","Peugeot","Renault","Skoda",
-        "Tata","Toyota","Volkswagen","Volvo"
+BODY_COLS = ["body_type", "type", "segment", "category"]
+
+BODY_MAP = {
+    "suv": "suv", "crossover": "suv", "cross-over": "suv",
+    "mpv": "mpv", "muv": "mpv",
+    "sedan": "sedan",
+    "hatchback": "hatchback", "hatch": "hatchback",
+    "wagon": "wagon", "estate": "wagon",
+    "coupe": "coupe",
+    "convertible": "convertible", "cabrio": "convertible", "cabriolet": "convertible", "roadster": "convertible",
+    "pickup": "pickup", "pick-up": "pickup", "truck": "pickup",
+    "van": "van", "minivan": "van",
+}
+
+def _resolve_body_col(df):
+    return next((c for c in BODY_COLS if c in df.columns), None)
+
+def add_body_norm(df):
+    col = _resolve_body_col(df)
+    if not col:
+        return df, None
+    s = df[col].astype(str).str.strip().str.lower()
+    # normalize by keywords
+    def _norm(x):
+        for k, v in BODY_MAP.items():
+            if k in x:
+                return v
+        return None
+    df["body_norm"] = s.apply(_norm)
+    return df, "body_norm"
+
+
+def _rank_key_exists(col): 
+    return col in df.columns
+
+SCHEMA_HINT = {
+    "columns": list(df.columns),
+    "primary_keys": [c for c in ["car","brand","model","year"] if c in df.columns],
+    "categories": {
+        "body": sorted(df["body_norm"].dropna().unique().tolist()) if "body_norm" in df.columns else [],
+        "brand": sorted(df["brand"].dropna().unique().tolist()) if "brand" in df.columns else [],
+    },
+    "synonyms": {
+        "SUV": ["suv","crossover"],
+        "MPV": ["mpv","muv"],
+        "Pickup": ["pickup","truck"],
+        "Wagon": ["wagon","estate"],
+        "Convertible": ["convertible","cabrio","cabriolet","roadster"],
+        "Hatchback": ["hatchback","hatch"]
+    },
+    "ranking": [
+        {"column": "soft_buy_score", "direction": "desc"} if "soft_buy_score" in df.columns else None,
+        {"column": "price_eur",      "direction": "asc"}  if "price_eur" in df.columns else None,
+        {"column": "year",           "direction": "desc"} if "year" in df.columns else None,
+        {"column": "km_driven",      "direction": "asc"}  if "km_driven" in df.columns else None,
     ]
-    # How these column names appear in your dataframe (lowercased, spaces -> _, hyphens kept)
-    make_cols = []
-    col_to_brand = {}
-    for b in brands_pretty:
-        normalized = b.lower().replace(" ", "_")  # keep hyphens as-is
-        col = f"make_{normalized}"
-        if col in df2.columns:
-            make_cols.append(col)
-            col_to_brand[col] = b
+}
+SCHEMA_HINT["ranking"] = [r for r in SCHEMA_HINT["ranking"] if r]
 
-    if make_cols:
-        vals = df2[make_cols]
-        maxvals = vals.max(axis=1)
-        idx = vals.idxmax(axis=1)  # returns a column name per row
-        brend = idx.map(col_to_brand)
-        brend = brend.where(maxvals >= 1, other=np.nan)  # only set if some make_* == 1
-        df2["brend"] = brend
-    else:
-        df2["brend"] = np.nan
+df, BODY_USED = add_body_norm(df)
 
-    # Normalize/alias the exact column names you want to display
-    if "selling_price" not in df2.columns and "price" in df2.columns:
-        df2["selling_price"] = df2["price"]
-
-    if "km_driven" not in df2.columns:
-        for alt in ["km_driven", "kilometers", "km", "mileage", "mileage_val"]:
-            if alt in df2.columns:
-                df2["km_driven"] = df2[alt]
-                break
-
-    if "engine_cc" not in df2.columns:
-        for alt in ["engine_cc", "engine", "cc"]:
-            if alt in df2.columns:
-                df2["engine_cc"] = df2[alt]
-                break
-
-    if "power_bhp" not in df2.columns and "power" in df2.columns:
-        df2["power_bhp"] = df2["power"]
-
-    return df2
 
 # ---------- Navigation ----------
 role = st.session_state["role"]
@@ -469,10 +1022,11 @@ if section == "Best Deals" and role == "owner":
     score_col = cols["soft"]
     if score_col not in df.columns:
         st.info("soft_buy_score not found—showing a basic top list.")
-        tmp = add_brend_and_standardize(df)
-        show_cols = [c for c in ["brend","year","selling_price","km_driven","engine_cc","power_bhp"] if c in tmp.columns]
-        st.dataframe(tmp.sort_values(tmp.columns[0]).head(10)[show_cols], use_container_width=True, hide_index=True)
+        tmp = df.copy()  # already has reliable 'car'
+        show_cols = [c for c in ["car","brand","model","year","price_eur_str","km_driven","engine_cc","power_bhp"] if c in tmp.columns]
+        st.dataframe(tmp.head(10)[show_cols], use_container_width=True, hide_index=True)
         st.stop()
+
 
     # --- Class A ---
     class_a = df[df[score_col] >= 0.7].copy()
@@ -480,13 +1034,10 @@ if section == "Best Deals" and role == "owner":
     if class_a.empty:
         st.caption("No vehicles meet this criterion.")
     else:
-        top_a = class_a.sort_values(score_col, ascending=False).head(10)
-        top_a = add_brend_and_standardize(top_a)
-        show_cols = [c for c in ["brend","year","selling_price","km_driven","engine_cc","power_bhp"] if c in top_a.columns]
+        top_a = ensure_car_name(class_a.sort_values(score_col, ascending=False).head(10).copy())
+        show_cols = [c for c in ["car","brand","model","year","price_eur_str","km_driven","engine_cc","power_bhp"] if c in top_a.columns]
         st.dataframe(top_a[show_cols], use_container_width=True, hide_index=True)
-        st.caption("Top 10 high-performing vehicles with score ≥ 0.7.")
 
-    st.divider()
 
     # --- Class B ---
     class_b = df[(df[score_col] >= 0.5) & (df[score_col] < 0.7)].copy()
@@ -494,11 +1045,17 @@ if section == "Best Deals" and role == "owner":
     if class_b.empty:
         st.caption("No vehicles meet this criterion.")
     else:
-        top_b = class_b.sort_values(score_col, ascending=False).head(10)
-        top_b = add_brend_and_standardize(top_b)
-        show_cols = [c for c in ["brend","year","selling_price","km_driven","engine_cc","power_bhp"] if c in top_b.columns]
+        top_b = class_b.sort_values(score_col, ascending=False).head(10).copy()
+        if "car" not in top_b.columns:
+            if {"brand","model"}.issubset(top_b.columns):
+                top_b["car"] = (top_b["brand"].fillna("") + " " + top_b["model"].fillna("")).str.strip()
+            elif "brand" in top_b.columns:
+                top_b["car"] = top_b["brand"]
+            else:
+                top_b["car"] = "—"
+        show_cols = [c for c in ["car","brand","model","year","price_eur_str","km_driven","engine_cc","power_bhp"] if c in top_b.columns]
         st.dataframe(top_b[show_cols], use_container_width=True, hide_index=True)
-        st.caption("Top 10 moderately strong offers with score between 0.5 – 0.7.")
+
 
 
 # ----------- Classification (owners) -----------
@@ -533,94 +1090,228 @@ elif section == "Classification" and role == "owner":
         if df_block.empty:
             st.caption("No vehicles meet this criterion.")
             return
-        tmp = add_brend_and_standardize(df_block)
-        cols_to_show = [c for c in ["brend","year","selling_price","km_driven","engine_cc","power_bhp"] if c in tmp.columns]
+        tmp = ensure_car_name(df_block)  # standardize
+        cols_to_show = [c for c in ["car","brand","model","year","price_eur_str","km_driven","engine_cc","power_bhp"] if c in tmp.columns]
         st.dataframe(tmp[cols_to_show], use_container_width=True, hide_index=True)
         st.caption(caption_text)
+
+
 
     show_block(class_a, "### Class A — Premium Deals", "All vehicles with score ≥ 0.7.")
     st.divider()
     show_block(class_b, "### Class B — Good Deals", "All vehicles within the 0.5–0.7 range.")
     st.divider()
     show_block(class_c, "### Class C — Fair/Poor Deals", "All vehicles below 0.5.")
-
+    
 # ----------- Chat (customers) -----------
 elif section == "Chat" and role == "customer":
-    st.subheader("💬 Ask about the inventory")
-    for r,m in st.session_state["chat"]: st.chat_message(r).markdown(m)
-    msg = st.chat_input("Ask anything (e.g., 'Best SUVs under 15k')")
-    if msg:
-        st.chat_message("user").markdown(msg)
-        subset = relevant_rows(df, msg, cols, limit=25)
-        ctx = to_context(subset, cols, n=15)
-        ans = ask_openai(msg, ctx)
-        st.chat_message("assistant").markdown(ans)
-        st.session_state["chat"] += [("user", msg), ("assistant", ans)]
+    st.subheader("💬 Chat with DealBot")
+    import re
 
-# ----------- Clustering (customers) -----------
+    def _year_from_query(q):
+        yrs = re.findall(r"\b(19|20)\d{2}\b", q)
+        return [int(y) if isinstance(y, str) else int("".join(y)) for y in yrs] if yrs else []
+
+    def _body_tokens(q):
+        ql = q.lower()
+        tokens = []
+        for k, syns in {**SCHEMA_HINT["synonyms"], "Sedan": ["sedan"]}.items():
+            for s in syns:
+                if re.search(rf"\b{s}s?\b", ql):
+                    tokens.append(s)  # store normalized synonym
+        return list(set(tokens))
+
+    def _brand_tokens(q):
+        if "brand" not in df.columns: return []
+        ql = q.lower()
+        brands = [b for b in SCHEMA_HINT.get("categories", {}).get("brand", [])]
+        return [b for b in brands if b and b.lower() in ql]
+
+    def build_slice_for_llm(user_msg, df):
+        base = df.copy()
+
+        # Body prefilter (only if we have body_norm)
+        btoks = _body_tokens(user_msg)
+        if "body_norm" in base.columns and btoks:
+            # map synonyms back to our normalized labels
+            backmap = {s: "suv" for s in ["suv","crossover"]}
+            backmap.update({s: "mpv" for s in ["mpv","muv"]})
+            backmap.update({s: "pickup" for s in ["pickup","truck"]})
+            backmap.update({s: "wagon" for s in ["wagon","estate"]})
+            backmap.update({s: "convertible" for s in ["convertible","cabrio","cabriolet","roadster"]})
+            backmap.update({"hatchback":"hatchback", "hatch":"hatchback", "sedan":"sedan"})
+            wanted = {backmap.get(s, s) for s in btoks}
+            base = base[base["body_norm"].isin(wanted)]
+
+        # Year prefilter
+        yrs = _year_from_query(user_msg)
+        if "year" in base.columns and yrs:
+            if len(yrs) == 1:
+                base = base[base["year"] == yrs[0]]
+            elif len(yrs) >= 2:
+                lo, hi = sorted(yrs[:2])
+                base = base[(base["year"] >= lo) & (base["year"] <= hi)]
+
+        # Brand prefilter
+        bt = _brand_tokens(user_msg)
+        if "brand" in base.columns and bt:
+            base = base[base["brand"].str.lower().isin([x.lower() for x in bt])]
+
+        # Deduplicate so the model doesn't repeat identical lines
+        dedupe_cols = [c for c in ["car","year","price_eur_str"] if c in base.columns]
+        if dedupe_cols:
+            base = base.drop_duplicates(subset=dedupe_cols)
+
+        return base
+
+
+    # tiny toolbar
+    col_a, col_b = st.columns([0.8, 0.2])
+    with col_b:
+        if st.button("Reset chat"):
+            st.session_state["chat"] = []
+            st.rerun()
+
+    # show previous turns
+    for who, text in st.session_state["chat"]:
+        with st.chat_message("assistant" if who == "assistant" else "user"):
+            st.markdown(text)
+
+    user_msg = st.chat_input("Ask anything about the cars in this dataset…")
+    if user_msg:
+        st.session_state["chat"].append(("user", user_msg))
+        with st.chat_message("user"):
+            st.markdown(user_msg)
+
+        # Always answer from data (brief, <= 5 lines)
+        # LLM-first: build a relevant slice, send schema + rows + question
+        try:
+            # bigger slice for recall, smaller context for the model
+            pref = build_slice_for_llm(user_msg, df)
+            # if we filtered too hard and got tiny, fall back to global relevance
+            source_df = pref if len(pref) >= 5 else df
+            rel_df = relevant_rows(source_df, user_msg, cols, limit=80)
+            rows = to_context(rel_df, cols, n=30)
+            ans_text = ask_llm_with_schema(SCHEMA_HINT, rows, user_msg)
+        except Exception as e:
+            ans_text = f"Sorry — something went wrong: {e}"
+
+        with st.chat_message("assistant"):
+            st.markdown(ans_text)
+            with st.expander("Data used for this answer", expanded=False):
+                # Show exactly what the model saw
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.session_state["chat"].append(("assistant", ans_text))
+
+
+
+
+# ----------- Chat (customers) -----------
 elif section == "Clustering" and role == "customer":
-    st.subheader("🧩 Clustering")
-    mileage_col = cols["mileage"] if cols["mileage"] in df.columns else cols["km"]
-    options = {
-        "Year": [c for c in [cols["year"]] if c],
-        "Price": [c for c in [cols["price"]] if c],
-        "Mileage/KM": [c for c in [mileage_col] if c],
-        "Year + Price": [x for x in [cols["year"], cols["price"]] if x],
-    }
-    choice = st.radio("What to cluster by", list(options.keys()), horizontal=True)
-    k = st.slider("Clusters (k)", min_value=3, max_value=10, value=4, step=1)
-    view = st.radio("View", ["Table", "Plot"], horizontal=True)
-    use_cols = options[choice]
-    clustered, centers = run_clustering(df, use_cols, k=k)
-    if clustered is None or centers is None or len(centers) == 0:
-        st.info("Not enough data for that choice. Try a smaller k or a different axis.")
+    st.subheader("🧩 Build Your Own Clusters")
+
+    # 2.1 Variable catalog + smart defaults
+    var_catalog = build_variable_catalog(df, cols)
+    if not var_catalog:
+        st.info("Not enough fields to cluster.")
         st.stop()
 
-    name_map = name_clusters(centers.set_index("cluster").drop(columns=[c for c in ["cluster"] if c in centers.columns], errors="ignore"))
-    clustered["cluster_name"] = clustered["cluster"].map(name_map).fillna("Cluster")
+    # Suggested defaults (good for most shoppers)
+    smart_defaults = [v for v in ["Year", "Price (EUR)", "Mileage (km_driven)", "Power (bhp)"] if v in var_catalog][:2]
+    picked = st.multiselect(
+        "Choose the variables to cluster on (numeric and/or categorical):",
+        list(var_catalog.keys()),
+        default=smart_defaults
+    )
 
-    if view == "Table":
-        sizes = clustered["cluster"].value_counts().rename_axis("cluster").reset_index(name="count")
-        overview = centers.merge(sizes, on="cluster", how="left")
-        overview["name"] = overview["cluster"].map(name_map).fillna("Cluster")
-        metric_cols = [c for c in [cols["year"], cols["price"], mileage_col] if c in overview.columns]
-        overview = overview[["cluster", "name", "count"] + metric_cols].sort_values("cluster")
-        st.markdown("**Cluster Overview**")
-        st.dataframe(overview.round(1), use_container_width=True, hide_index=True)
+    if not picked:
+        st.warning("Pick at least one variable.")
+        st.stop()
+
+    # 2.2 Per-variable filters
+    st.markdown("### Filters")
+    filters = render_filters_ui(df, picked, var_catalog)
+    df_f = apply_filters(df, filters)
+    st.caption(f"Filtered dataset: **{len(df_f):,}** cars")
+
+    if df_f.empty:
+        st.info("No cars match your filters. Adjust and try again.")
+        st.stop()
+
+    # 2.3 Map picks to actual column names and types
+    numeric_cols = [var_catalog[p]["key"] for p in picked if var_catalog[p]["type"] == "numeric"]
+    categorical_cols = [var_catalog[p]["key"] for p in picked if var_catalog[p]["type"] == "categorical"]
+
+    # 2.4 Cluster controls (K and sample size)
+    c1, c2 = st.columns(2)
+    with c1:
+        K = st.slider("How many clusters?", min_value=2, max_value=10, value=FIXED_K, step=1)
+    with c2:
+        max_rows = st.slider("Max cars to consider (speed vs. accuracy)", 500, 10000, 3000, step=500)
+
+    # For speed: sample if huge
+    if len(df_f) > max_rows:
+        df_run = df_f.sample(n=max_rows, random_state=42)
     else:
-        import networkx as nx
-        import plotly.graph_objects as go
-        from scipy.spatial.distance import pdist, squareform
+        df_run = df_f
 
-        st.markdown("**Cluster Graph**")
-        G = nx.Graph()
-        numeric_centers = centers.drop(columns=["cluster"], errors="ignore")
-        if numeric_centers.shape[0] > 1:
-            dists = squareform(pdist(numeric_centers.values))
-            thr = float(np.median(dists) * 1.5)
-            for i in range(len(dists)):
-                for j in range(i + 1, len(dists)):
-                    w = float(dists[i, j])
-                    if w < thr:
-                        G.add_edge(int(i), int(j), weight=w)
-        for _, row in centers.iterrows():
-            idx = int(row["cluster"]); G.add_node(idx, label=f"Cluster {idx}", size=20)
-        pos = nx.spring_layout(G, seed=42, k=0.5)
-        edge_x, edge_y = [], []
-        for a, b in G.edges():
-            x0, y0 = pos[a]; x1, y1 = pos[b]
-            edge_x += [x0, x1, None]; edge_y += [y0, y1, None]
-        edge_trace = go.Scatter(x=edge_x, y=edge_y, mode="lines", hoverinfo="none", line=dict(width=1, color="#888"))
-        node_x, node_y, text = [], [], []
-        for n in G.nodes():
-            x, y = pos[n]; node_x.append(x); node_y.append(y); text.append(f"Cluster {n}")
-        node_trace = go.Scatter(x=node_x, y=node_y, mode="markers+text", text=text, textposition="top center",
-                                marker=dict(showscale=False, color=list(G.nodes()), size=22,
-                                            line=dict(width=2, color="DarkSlateGrey")), hoverinfo="text")
-        fig = go.Figure(data=[edge_trace, node_trace],
-                        layout=go.Layout(title=dict(text="Cluster Relationships", font=dict(size=18)),
-                                         showlegend=False, hovermode="closest",
-                                         margin=dict(b=0, l=0, r=0, t=40),
-                                         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                                         yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)))
-        st.plotly_chart(fig, use_container_width=True)
+    # 2.5 Run flexible clustering
+    labels = run_clustering_flexible(df_run, numeric_cols, categorical_cols, k=K)
+    if labels is None:
+        st.info("Not enough usable data after filtering to run clustering.")
+        st.stop()
+
+    # 2.6 Build summaries
+    summ = summarize_clusters(df_run, labels, numeric_cols, categorical_cols)
+
+    # 2.7 Show group summary
+    st.markdown("### Group Summary")
+    # choose columns to show: always show count, medians for common numeric, and top for categs
+    show_cols = ["cluster", "label", "count"]
+    for c in ["year","price_eur","km_driven","power_bhp","engine_cc","seats"]:
+        cmed = c + "_median"
+        if cmed in summ.columns:
+            show_cols.append(cmed)
+    # pretty Euro if present
+    if "price_eur_median_str" in summ.columns:
+        # replace numeric price median with string display
+        show_cols = [c for c in show_cols if c != "price_eur_median"]
+        show_cols.insert( show_cols.index("count")+1, "price_eur_median_str")
+
+    # add top category columns
+    for c in categorical_cols:
+        col = c + "_top"
+        if col in summ.columns:
+            show_cols.append(col)
+
+    st.dataframe(summ[show_cols], use_container_width=True, hide_index=True)
+
+    # 2.8 Let the user pick a cluster
+    st.markdown("### Explore a Cluster")
+    cluster_labels = {int(r.cluster): (r.label or f"Cluster {int(r.cluster)}") for _, r in summ.iterrows()}
+    pick_cluster = st.selectbox(
+        "Show cars in cluster",
+        options=summ["cluster"].tolist(),
+        format_func=lambda cid: f"Cluster {cid} — {cluster_labels.get(int(cid), '')}"
+    )
+
+    # Representatives: show cars from chosen cluster
+    chosen_idx = labels[labels == int(pick_cluster)].index
+    display = df_run.loc[chosen_idx].copy()
+    display = ensure_car_name(display)
+
+    # Optional brand snapshot if brand is available
+    if "brand" in display.columns and not display["brand"].dropna().empty:
+        st.markdown("**Top brands in this cluster**")
+        top_brands = (
+            display["brand"].fillna("—").value_counts().rename_axis("brand").reset_index(name="count").head(6)
+        )
+        st.dataframe(top_brands, use_container_width=True, hide_index=True)
+
+    # 2.9 Show the cars table
+    nicer_cols = [c for c in ["car","year","price_eur_str","km_driven","power_bhp","engine_cc","seats","fuel","transmission","body_norm","soft_buy_score"] if c in display.columns]
+    if "price_eur" in display.columns:
+        display = display.sort_values(["price_eur","year"] if "year" in display.columns else ["price_eur"], na_position="last")
+    st.dataframe(display[nicer_cols], use_container_width=True, hide_index=True)
+    st.caption("Tip: tweak variables and filters above to reshape the clusters.")
