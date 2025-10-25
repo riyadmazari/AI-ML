@@ -204,16 +204,6 @@ hr,.stProgress>div>div>div{
   gap: 1rem;
   text-align: center;
 }
-.center-container > * {
-  width: 100%;
-  max-width: 500px; /* adjust as you like */
-}
-
-/* Keep the whole app comfortably centered on wide displays */
-.block-container{
-  max-width: 980px;   /* tweak 880–1100 as you like */
-  margin: 0 auto;
-}
 
 
 </style>
@@ -1593,26 +1583,21 @@ elif section == "Clustering" and role == "customer":
     numeric_cols = [var_catalog[p]["key"] for p in picked if var_catalog[p]["type"] == "numeric"]
     categorical_cols = [var_catalog[p]["key"] for p in picked if var_catalog[p]["type"] == "categorical"]
 
-    # 2.4 Cluster controls (K and sample size)
-    c1, c2 = st.columns(2)
+    # 2.4 Number of clusters control
+    c1, c2 = st.columns([0.3, 0.7])
     with c1:
         K = st.slider("How many clusters?", min_value=2, max_value=10, value=FIXED_K, step=1)
-    with c2:
-        max_rows = st.slider("Max cars to consider (speed vs. accuracy)", 500, 10000, 3000, step=500)
 
-    # For speed: sample if huge
-    if len(df_f) > max_rows:
-        df_run = df_f.sample(n=max_rows, random_state=42)
-    else:
-        df_run = df_f
-
-    # 2.5 Run flexible clustering
-    labels = run_clustering_flexible(df_run, numeric_cols, categorical_cols, k=K)
+    # 2.5 Run flexible clustering on full filtered dataset
+    labels = run_clustering_flexible(df_f, numeric_cols, categorical_cols, k=K)
     if labels is None:
         st.info("Not enough usable data after filtering to run clustering.")
         st.stop()
 
-    # 2.6 Build summaries
+    # Keep reference to working dataset for display
+    df_run = df_f
+
+    # 2.6 Build summaries  
     summ = summarize_clusters(df_run, labels, numeric_cols, categorical_cols)
 
     # 2.7 Show group summary
@@ -1652,17 +1637,6 @@ elif section == "Clustering" and role == "customer":
     chosen_idx = labels[labels == int(pick_cluster)].index
     display = df_run.loc[chosen_idx].copy()
     display = ensure_car_name(display)
-
-    # Optional brand snapshot if brand is available
-    if "brand" in display.columns and not display["brand"].dropna().empty:
-        st.markdown("**Top brands in this cluster**")
-        top_brands = (
-            display["brand"].fillna("—").value_counts().rename_axis("brand").reset_index(name="count").head(6)
-        )
-        
-        st.dataframe(top_brands, use_container_width=True, hide_index=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
 
     # 2.9 Show the cars table
     nicer_cols = [c for c in ["car","year","price_eur_str","km_driven","power_bhp","engine_cc","seats","fuel","transmission","body_norm","soft_buy_score"] if c in display.columns]
