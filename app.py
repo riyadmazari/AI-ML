@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+from openai import OpenAI
 from sklearn.linear_model import LogisticRegression
 from sklearn.linear_model import ElasticNetCV
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -11,22 +12,27 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
+from dotenv import load_dotenv
 import joblib
+
+load_dotenv()
 
 # ----- Altair brand theme -----
 brand_range = ["#4C12A1", "#00A74A", "#00B5E2", "#0C0C0C", "#F0F2F6"]
-alt.themes.register('movelit_dark', lambda: {
-    "config": {
-        "range": {
-            "category": ["#00B5E2", "#00A74A", "#4C12A1", "#FFFFFF", "#161616"],
-            "heatmap": ["#161616", "#00B5E2", "#00A74A"]
-        },
-        "title": {"fontSize": 16, "fontWeight": 700, "color": "#FFFFFF"},
-        "axis": {"labelColor": "#FFFFFF", "titleColor": "#FFFFFF"},
-        "legend": {"labelColor": "#FFFFFF", "titleColor": "#FFFFFF"}
-    }
-})
-alt.themes.enable('movelit_dark')
+@alt.theme.register('movelit_dark', enable=True)
+def movelit_dark():
+    return alt.theme.ThemeConfig({
+        "config": {
+            "range": {
+                "category": ["#00B5E2", "#00A74A", "#4C12A1", "#FFFFFF", "#161616"],
+                "heatmap":  ["#161616", "#00B5E2", "#00A74A"]
+            },
+            "title":  {"fontSize": 16, "fontWeight": 700, "color": "#FFFFFF"},
+            "axis":   {"labelColor": "#FFFFFF", "titleColor": "#FFFFFF"},
+            "legend": {"labelColor": "#FFFFFF", "titleColor": "#FFFFFF"}
+        }
+    })
+alt.theme.enable('movelit_dark')
 
 
 
@@ -40,8 +46,6 @@ SYSTEM_PROMPT = (
     "- When referring to price, ALWAYS use 'price_eur' (numeric) or 'price_eur_str' (already formatted). "
     "NEVER use 'selling_price' or show '₹'.\n"
     "- For the car label, use the 'car' column EXACTLY as given; do not prepend/duplicate brand/model.\n"
-    "- If the question mentions a body style (SUV, sedan, hatchback, pickup, wagon, convertible, MPV), "
-    "filter by 'body_norm' or mapped synonyms in schema.synonyms when present.\n"
     "- For 'best'/'top' ranking: sort by soft_buy_score ↓, then price_eur ↑, then year ↓, then km_driven ↑ when present.\n"
     "- If the user asks for N items, return up to N.\n"
     "- Be concise (≤ 5 short lines) and cite car name/year/price from the rows."
@@ -56,11 +60,27 @@ OWNER_PASSWORD = "123"
 FIXED_K = 5    # fixed number of clusters for customers
 # ----------------------------
 
-try:
-    from openai import OpenAI
-    client = OpenAI()
-except Exception:
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    st.error("❌ OPENAI_API_KEY not found in .env file.")
     client = None
+else:
+    for k in ("OPENAI_ORG", "OPENAI_PROJECT", "OPENAI_API_BASE"):
+        os.environ.pop(k, None)  # remove any old env vars
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    
+    try:
+    # light, quick call to confirm routing & quota
+        _ = client.models.list()
+    except Exception as e:
+        msg = str(e)
+        if "insufficient_quota" in msg:
+            st.error("Your key is valid but the project/org has no active credit. "
+                    "Add a payment method or increase quota on that account.")
+        else:
+            st.error(f"OpenAI setup error: {msg}")
+        client = None
 
 st.set_page_config(
     page_title="Dealer Deals", layout="wide",
@@ -415,22 +435,15 @@ def relevant_rows(df, query, c, limit=25):
     temp["_rel"] = score
     return df.loc[temp.sort_values("_rel", ascending=False).head(limit).index]
 
-def to_context(df, c, n=30):
-    candidate_cols = [
-        "id_placeholder",        # will be removed; we insert id later
-        "car","brand","model","year",
-        "price_eur","price_eur_str",   # <— Euro fields only
-        "km_driven","soft_buy_score","power_bhp","engine_cc",
-        c.get("mileage") or "mileage_val",
-        "fuel","transmission",
-        "body_norm"
-    ]
-    keep = [col for col in candidate_cols if isinstance(col, str) and col in df.columns]
+# Replace your to_context with a slimmer one
+def to_context(df, n=12):
+    keep = [c for c in ["car","year","price_eur","price_eur_str","km_driven","soft_buy_score","body_norm"] if c in df.columns]
     small = df[keep].head(n).reset_index(drop=True)
     small.insert(0, "id", small.index + 1)
-    return small.to_dict(orient="records")
-
-
+    # alias keys to shrink JSON
+    alias = {"id":"i","car":"c","year":"y","price_eur":"p","price_eur_str":"ps",
+             "km_driven":"km","soft_buy_score":"s","body_norm":"b"}
+    return [{alias[k]: v for k,v in row.items()} for row in small.to_dict(orient="records")]
     
 def ask_llm_with_schema(schema, rows, question):
     if client is None:
@@ -438,15 +451,20 @@ def ask_llm_with_schema(schema, rows, question):
     payload = {"schema": schema, "rows": rows, "question": question}
     try:
         resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=OPENAI_TEMPERATURE,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": json.dumps(payload, ensure_ascii=False)}
-            ],
-        )
+        model=OPENAI_MODEL,
+        temperature=OPENAI_TEMPERATURE,
+        max_tokens=200,  # add this line
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": json.dumps(payload, ensure_ascii=False)}
+        ],
+    )
         return resp.choices[0].message.content.strip()
     except Exception as e:
+        msg = str(e)
+        if "insufficient_quota" in msg:
+            return ("Billing/quota error: this API key’s project/org has no active credit. "
+                    "Use a key with billing enabled or raise the limit.")
         return f"Error: {e}"
 
 # ========= NEW: flexible clustering helpers =========
@@ -958,27 +976,12 @@ def _rank_key_exists(col):
     return col in df.columns
 
 SCHEMA_HINT = {
-    "columns": list(df.columns),
-    "primary_keys": [c for c in ["car","brand","model","year"] if c in df.columns],
-    "categories": {
-        "body": sorted(df["body_norm"].dropna().unique().tolist()) if "body_norm" in df.columns else [],
-        "brand": sorted(df["brand"].dropna().unique().tolist()) if "brand" in df.columns else [],
-    },
-    "synonyms": {
-        "SUV": ["suv","crossover"],
-        "MPV": ["mpv","muv"],
-        "Pickup": ["pickup","truck"],
-        "Wagon": ["wagon","estate"],
-        "Convertible": ["convertible","cabrio","cabriolet","roadster"],
-        "Hatchback": ["hatchback","hatch"]
-    },
-    "ranking": [
-        {"column": "soft_buy_score", "direction": "desc"} if "soft_buy_score" in df.columns else None,
-        {"column": "price_eur",      "direction": "asc"}  if "price_eur" in df.columns else None,
-        {"column": "year",           "direction": "desc"} if "year" in df.columns else None,
-        {"column": "km_driven",      "direction": "asc"}  if "km_driven" in df.columns else None,
-    ]
+    "ranking": [{"col":"s","dir":"desc"}, {"col":"p","dir":"asc"}, {"col":"y","dir":"desc"}, {"col":"km","dir":"asc"}],
+    "synonyms": {"SUV":["suv","crossover"], "MPV":["mpv","muv"], "Pickup":["pickup","truck"],
+                 "Wagon":["wagon","estate"], "Convertible":["convertible","cabrio","cabriolet","roadster"],
+                 "Hatchback":["hatchback","hatch"]}
 }
+
 SCHEMA_HINT["ranking"] = [r for r in SCHEMA_HINT["ranking"] if r]
 
 df, BODY_USED = add_body_norm(df)
@@ -1520,27 +1523,28 @@ elif section == "Chat" and role == "customer":
         with st.chat_message("user"):
             st.markdown(user_msg)
 
-        # Always answer from data (brief, <= 5 lines)
-        # LLM-first: build a relevant slice, send schema + rows + question
-        try:
-            # bigger slice for recall, smaller context for the model
-            pref = build_slice_for_llm(user_msg, df)
-            # if we filtered too hard and got tiny, fall back to global relevance
-            source_df = pref if len(pref) >= 5 else df
-            rel_df = relevant_rows(source_df, user_msg, cols, limit=80)
-            rows = to_context(rel_df, cols, n=30)
-            ans_text = ask_llm_with_schema(SCHEMA_HINT, rows, user_msg)
-        except Exception as e:
-            ans_text = f"Sorry — something went wrong: {e}"
-
         with st.chat_message("assistant"):
+            # Show thinking message while processing
+            with st.spinner("DealBot is thinking..."):
+                try:
+                    # bigger slice for recall, smaller context for the model
+                    pref = build_slice_for_llm(user_msg, df)
+                    # if we filtered too hard and got tiny, fall back to global relevance
+                    source_df = pref if len(pref) >= 5 else df
+                    rel_df = relevant_rows(source_df, user_msg, cols, limit=80)
+                    N = min(_extract_top_n(user_msg, default=10) or 10, 15)
+                    rows = to_context(rel_df, n=N)
+                    ans_text = ask_llm_with_schema(SCHEMA_HINT, rows, user_msg)
+                except Exception as e:
+                    ans_text = f"Sorry — something went wrong: {e}"
+                
             st.markdown(ans_text)
             with st.expander("Data used for this answer", expanded=False):
-                # Show exactly what the model saw
-                
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                if 'rows' in locals() and isinstance(rows, list):
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No rows to display (the call failed before preparing context).")
                 st.markdown('</div>', unsafe_allow_html=True)
-
 
         st.session_state["chat"].append(("assistant", ans_text))
 
